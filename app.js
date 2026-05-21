@@ -1,8 +1,9 @@
 const APP_ID = "app_jnnlkgx7ehdy";
 const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
-const BUILD_ID = "semantic-chunks-2026-05-21";
+const BUILD_ID = "local-mock-ai-2026-05-21";
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
+const USE_MOCK_AI = true;
 
 window.PDF_ANNOTATOR_BUILD_ID = BUILD_ID;
 document.documentElement.dataset.build = BUILD_ID;
@@ -56,6 +57,18 @@ function countSentences(text) {
 
 function normalizeText(text) {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function normalizeForMatch(text) {
+  return normalizeText(text)
+    .toLowerCase()
+    .replace(/[\ufb01]/g, "fi")
+    .replace(/[\ufb02]/g, "fl")
+    .replace(/[^\w\s]/g, " ");
+}
+
+function splitIntoSentences(text) {
+  return normalizeText(text).match(/[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g)?.map((sentence) => sentence.trim()).filter(Boolean) || [];
 }
 
 function getFontSize(item) {
@@ -333,7 +346,142 @@ function getSummarizationPages() {
   }));
 }
 
+function makeMockChunk(label, sentences) {
+  return {
+    label,
+    sourceText: normalizeText(sentences.filter(Boolean).join(" ")),
+  };
+}
+
+function chunkBySentenceRanges(sentences, ranges) {
+  return ranges
+    .map(([label, start, end]) => makeMockChunk(label, sentences.slice(start, end)))
+    .filter((chunk) => chunk.sourceText);
+}
+
+function findSentenceIndex(sentences, pattern) {
+  const normalizedPattern = normalizeForMatch(pattern);
+  return sentences.findIndex((sentence) => normalizeForMatch(sentence).includes(normalizedPattern));
+}
+
+function mockPlanForParagraph(text) {
+  const sentences = splitIntoSentences(text);
+  const normalized = normalizeForMatch(text);
+  if (sentences.length < 2) return null;
+
+  if (normalized.includes("bad final grade") && normalized.includes("mindful journaling") && normalized.includes("describe")) {
+    return {
+      header: "Mindfulness for Emotional Processing",
+      chunks: chunkBySentenceRanges(sentences, [
+        ["Emotional Impact of Bad Grades", 0, 2],
+        ["Mindful Journaling Practice", 2, 4],
+        ["Describing Emotions Objectively", 4, sentences.length],
+      ]),
+    };
+  }
+
+  if (normalized.includes("nonjudgmentally") && normalized.includes("one mindfully") && normalized.includes("journaling")) {
+    const oneMindfully = findSentenceIndex(sentences, "One-Mindfully");
+    const effectively = Math.max(
+      findSentenceIndex(sentences, "Effectively"),
+      findSentenceIndex(sentences, "effectively, I would tailor"),
+    );
+    const secondStart = oneMindfully > 0 ? oneMindfully : Math.ceil(sentences.length / 3);
+    const thirdStart = effectively > secondStart ? effectively : Math.ceil((sentences.length * 2) / 3);
+    return {
+      header: "HOW Skills for Mindful Journaling",
+      chunks: chunkBySentenceRanges(sentences, [
+        ["Nonjudgmental Acceptance", 0, secondStart],
+        ["One-Mindful Focus", secondStart, thirdStart],
+        ["Effective Action Steps", thirdStart, sentences.length],
+      ]),
+    };
+  }
+
+  if (normalized.includes("recognize and validate my emotions") && normalized.includes("self discovery")) {
+    const growthStart = findSentenceIndex(sentences, "So, Mindful Journaling");
+    const splitAt = growthStart > 0 ? growthStart : Math.ceil(sentences.length / 2);
+    return {
+      header: "Benefits of Mindful Journaling",
+      chunks: chunkBySentenceRanges(sentences, [
+        ["Recognizing Emotional Patterns", 0, splitAt],
+        ["Turning Challenge into Growth", splitAt, sentences.length],
+      ]),
+    };
+  }
+
+  return {
+    header: null,
+    chunks: [makeMockChunk("Mock Summary", sentences)],
+  };
+}
+
+function annotationFromPlan(item, kind, label, originalText, index) {
+  const lineHeight = Math.max(20, item.fontSize * 1.55);
+  const x = kind === "bullet" ? item.x + Math.max(12, item.fontSize) : item.x;
+  return {
+    pageNumber: item.pageNumber,
+    sourceItemIds: [item.id],
+    kind,
+    label,
+    originalText,
+    x,
+    y: item.y + index * lineHeight,
+    width: Math.max(24, item.width - (kind === "bullet" ? Math.max(12, item.fontSize) : 0)),
+    height: lineHeight,
+  };
+}
+
+function mockSummarizeDocument() {
+  const annotations = [];
+  let summarizedParagraphs = 0;
+
+  state.pages.forEach((page) => {
+    page.items.forEach((item) => {
+      if (item.kind !== "paragraph" || countSentences(item.text) <= 2 || normalizeText(item.text).length <= 180) return;
+
+      const plan = mockPlanForParagraph(item.text);
+      if (!plan?.chunks?.length) return;
+
+      let rowIndex = 0;
+      if (plan.header) {
+        annotations.push(annotationFromPlan(item, "header", plan.header, "", rowIndex));
+        rowIndex += 1;
+      }
+
+      plan.chunks.forEach((chunk) => {
+        annotations.push(annotationFromPlan(item, "bullet", chunk.label, chunk.sourceText, rowIndex));
+        rowIndex += 1;
+      });
+
+      summarizedParagraphs += 1;
+    });
+  });
+
+  return {
+    document: {
+      title: state.file?.name?.replace(/\.pdf$/i, "") || "Mock Annotated PDF",
+      fileObjectId: null,
+    },
+    annotations,
+    stats: {
+      pages: state.pages.length,
+      summarizedParagraphs,
+      annotations: annotations.length,
+    },
+  };
+}
+
 async function summarizeDocument() {
+  if (USE_MOCK_AI) {
+    setStatus("Using local mock AI response...", 62);
+    const data = mockSummarizeDocument();
+    state.annotations = data.annotations || [];
+    els.docTitle.textContent = data.document?.title || state.file.name;
+    els.docSubtitle.textContent = `${data.stats?.summarizedParagraphs || 0} long paragraphs transformed with mock AI.`;
+    return;
+  }
+
   setStatus("Asking AI to create presentation annotations...", 62);
   const response = await fetch(`${API_BASE}/fn/summarize-document`, {
     method: "POST",
@@ -676,7 +824,11 @@ async function processCurrentPdf() {
   if (!state.file || !state.pages.length) return;
   els.processButton.disabled = true;
   try {
-    await uploadPdf(state.file);
+    if (USE_MOCK_AI) {
+      state.objectId = null;
+    } else {
+      await uploadPdf(state.file);
+    }
     await summarizeDocument();
     await renderPdfPages();
   } catch (error) {
