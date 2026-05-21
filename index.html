@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDF Annotator AI</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs" type="module"></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="mark">P</div>
+          <div>
+            <h1>PDF Annotator</h1>
+            <p>Turn dense PDFs into clickable presentation pages.</p>
+          </div>
+        </div>
+
+        <label class="drop-zone" for="pdfInput" id="dropZone">
+          <input id="pdfInput" type="file" accept="application/pdf" />
+          <span class="drop-title">Upload PDF</span>
+          <span class="drop-meta">10 MB max, processed page by page</span>
+        </label>
+
+        <button class="primary-action" id="processButton" disabled>Transform PDF</button>
+        <button class="secondary-action" id="sampleButton">Try Sample Text</button>
+
+        <div class="status-card">
+          <div class="status-row">
+            <span>Document</span>
+            <strong id="fileName">None</strong>
+          </div>
+          <div class="status-row">
+            <span>Pages</span>
+            <strong id="pageCount">0</strong>
+          </div>
+          <div class="status-row">
+            <span>Long paragraphs</span>
+            <strong id="paragraphCount">0</strong>
+          </div>
+          <div class="progress">
+            <div id="progressBar"></div>
+          </div>
+          <p id="statusText">Choose a PDF to begin.</p>
+        </div>
+
+        <div class="legend">
+          <div><span class="dot header-dot"></span>AI header</div>
+          <div><span class="dot bullet-dot"></span>AI bullet</div>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <header class="toolbar">
+          <div>
+            <h2 id="docTitle">Presentation Preview</h2>
+            <p id="docSubtitle">Original layout is preserved; long paragraphs become clickable presentation notes.</p>
+          </div>
+          <div class="toolbar-actions">
+            <button id="zoomOut" title="Zoom out" aria-label="Zoom out">-</button>
+            <span id="zoomLabel">100%</span>
+            <button id="zoomIn" title="Zoom in" aria-label="Zoom in">+</button>
+          </div>
+        </header>
+
+        <div class="pages" id="pages">
+          <div class="empty-state">
+            <h3>No PDF loaded</h3>
+            <p>Upload a PDF, then transform it into an annotated presentation.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <template id="popoverTemplate">
+      <div class="source-popover">
+        <button class="close-popover" aria-label="Close">x</button>
+        <h4>Original Text</h4>
+        <p></p>
+      </div>
+    </template>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

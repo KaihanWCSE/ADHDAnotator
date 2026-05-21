@@ -1,0 +1,513 @@
+const APP_ID = "app_jnnlkgx7ehdy";
+const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
+const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
+
+const state = {
+  file: null,
+  pdf: null,
+  pages: [],
+  annotations: [],
+  scale: 1,
+  objectId: null,
+};
+
+const els = {
+  input: document.getElementById("pdfInput"),
+  dropZone: document.getElementById("dropZone"),
+  processButton: document.getElementById("processButton"),
+  sampleButton: document.getElementById("sampleButton"),
+  pages: document.getElementById("pages"),
+  fileName: document.getElementById("fileName"),
+  pageCount: document.getElementById("pageCount"),
+  paragraphCount: document.getElementById("paragraphCount"),
+  statusText: document.getElementById("statusText"),
+  progressBar: document.getElementById("progressBar"),
+  docTitle: document.getElementById("docTitle"),
+  docSubtitle: document.getElementById("docSubtitle"),
+  zoomIn: document.getElementById("zoomIn"),
+  zoomOut: document.getElementById("zoomOut"),
+  zoomLabel: document.getElementById("zoomLabel"),
+  popoverTemplate: document.getElementById("popoverTemplate"),
+};
+
+const sampleText = `The American Civil War was a conflict between the northern states, known as the Union, and the southern states, known as the Confederacy, which had seceded from the United States. The war began in 1861 after years of political, economic, and moral tensions surrounding slavery, states' rights, and the expansion of slavery into western territories. Southern states depended heavily on enslaved labor for their agricultural economy, especially cotton production, while many in the North opposed the spread of slavery. The election of Abraham Lincoln in 1860 intensified these tensions because southern leaders feared his administration would limit slavery. Major battles such as Gettysburg, Antietam, and Vicksburg caused enormous casualties and destruction. During the war, Lincoln issued the Emancipation Proclamation, which declared enslaved people in Confederate states to be free and shifted the war's purpose toward ending slavery. The Union eventually defeated the Confederacy in 1865 due to its stronger industry, transportation systems, and larger population. The Civil War resulted in the abolition of slavery through the Thirteenth Amendment and permanently strengthened the federal government's authority over the states.`;
+
+async function loadPdfJs() {
+  const pdfjsLib = await import("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_URL;
+  return pdfjsLib;
+}
+
+function setStatus(text, progress) {
+  els.statusText.textContent = text;
+  if (typeof progress === "number") {
+    els.progressBar.style.width = `${Math.max(0, Math.min(100, progress))}%`;
+  }
+}
+
+function countSentences(text) {
+  return (text.match(/[.!?]+(?=\s|$)/g) || []).length;
+}
+
+function normalizeText(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function getFontSize(item) {
+  const [a, b] = item.transform;
+  return Math.max(8, Math.hypot(a, b));
+}
+
+function lineKey(y) {
+  return Math.round(y / 4) * 4;
+}
+
+function classifyBlock(block, medianFont) {
+  const text = block.text.trim();
+  if (/^(\u2022|[-*]|[0-9]+[.)])\s+/.test(text)) return "bullet";
+  if (block.fontSize >= medianFont * 1.35 && text.length < 120) return "title";
+  if (block.fontSize >= medianFont * 1.12 && text.length < 140) return "header";
+  if (countSentences(text) > 2 && text.length > 180) return "paragraph";
+  return "text";
+}
+
+function median(values) {
+  const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!sorted.length) return 12;
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
+  const spans = textContent.items
+    .map((item, index) => {
+      const text = normalizeText(item.str || "");
+      if (!text) return null;
+      const x = item.transform[4];
+      const y = viewport.height - item.transform[5];
+      const fontSize = getFontSize(item);
+      return {
+        id: `p${pageNumber}-s${index}`,
+        text,
+        x,
+        y: y - fontSize,
+        width: Math.max(item.width || text.length * fontSize * 0.42, 8),
+        height: fontSize * 1.35,
+        fontSize,
+      };
+    })
+    .filter(Boolean);
+
+  const medianFont = median(spans.map((span) => span.fontSize));
+  const lineMap = new Map();
+  spans.forEach((span) => {
+    const key = lineKey(span.y);
+    if (!lineMap.has(key)) lineMap.set(key, []);
+    lineMap.get(key).push(span);
+  });
+
+  const lines = [...lineMap.values()]
+    .map((lineSpans, index) => {
+      const ordered = lineSpans.sort((a, b) => a.x - b.x);
+      const text = normalizeText(ordered.map((span) => span.text).join(" "));
+      const x = Math.min(...ordered.map((span) => span.x));
+      const y = Math.min(...ordered.map((span) => span.y));
+      const right = Math.max(...ordered.map((span) => span.x + span.width));
+      const bottom = Math.max(...ordered.map((span) => span.y + span.height));
+      return {
+        id: `p${pageNumber}-l${index}`,
+        text,
+        x,
+        y,
+        width: right - x,
+        height: bottom - y,
+        fontSize: median(ordered.map((span) => span.fontSize)),
+      };
+    })
+    .sort((a, b) => a.y - b.y || a.x - b.x);
+
+  const blocks = [];
+  let current = null;
+
+  const flush = () => {
+    if (!current) return;
+    current.text = normalizeText(current.lines.map((line) => line.text).join(" "));
+    current.kind = classifyBlock(current, medianFont);
+    delete current.lines;
+    blocks.push(current);
+    current = null;
+  };
+
+  lines.forEach((line, index) => {
+    const previous = lines[index - 1];
+    const gap = previous ? line.y - (previous.y + previous.height) : 999;
+    const sameColumn = previous ? Math.abs(line.x - previous.x) < 32 : false;
+    const lineLooksStandalone = classifyBlock(line, medianFont) !== "text";
+
+    if (!current || lineLooksStandalone || gap > medianFont * 1.4 || !sameColumn) {
+      flush();
+      current = {
+        id: `p${pageNumber}-b${blocks.length}`,
+        pageNumber,
+        lines: [line],
+        x: line.x,
+        y: line.y,
+        width: line.width,
+        height: line.height,
+        fontSize: line.fontSize,
+      };
+      return;
+    }
+
+    current.lines.push(line);
+    current.x = Math.min(current.x, line.x);
+    current.y = Math.min(current.y, line.y);
+    const right = Math.max(current.x + current.width, line.x + line.width);
+    const bottom = Math.max(current.y + current.height, line.y + line.height);
+    current.width = right - current.x;
+    current.height = bottom - current.y;
+    current.fontSize = median(current.lines.map((l) => l.fontSize));
+  });
+  flush();
+
+  return blocks.map((block) => ({
+    ...block,
+    x: Math.max(0, block.x - 2),
+    y: Math.max(0, block.y - 2),
+    width: Math.min(viewport.width - block.x, block.width + 6),
+    height: block.height + 4,
+  }));
+}
+
+async function parsePdf(file) {
+  const pdfjsLib = await loadPdfJs();
+  const buffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
+  state.pdf = pdf;
+  state.pages = [];
+
+  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+    setStatus(`Reading page ${pageNumber} of ${pdf.numPages}...`, 8 + (pageNumber / pdf.numPages) * 34);
+    const page = await pdf.getPage(pageNumber);
+    const viewport = page.getViewport({ scale: 1.35 });
+    const textContent = await page.getTextContent();
+    const items = extractBlocksFromTextContent(textContent, viewport, pageNumber);
+    state.pages.push({
+      pageNumber,
+      width: viewport.width,
+      height: viewport.height,
+      items,
+    });
+  }
+}
+
+async function uploadPdf(file) {
+  setStatus("Creating secure upload URL...", 46);
+  const uploadResponse = await fetch(`${API_BASE}/fn/create-pdf-upload`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: file.name,
+      contentType: file.type || "application/pdf",
+      sizeBytes: file.size,
+    }),
+  });
+  const uploadData = await uploadResponse.json();
+  if (!uploadResponse.ok) throw new Error(uploadData.error || "Could not create upload URL");
+
+  setStatus("Uploading original PDF to Butterbase storage...", 52);
+  const putResponse = await fetch(uploadData.uploadUrl, {
+    method: "PUT",
+    headers: { "Content-Type": "application/pdf" },
+    body: file,
+  });
+  if (!putResponse.ok) throw new Error("PDF upload failed");
+  state.objectId = uploadData.objectId;
+}
+
+async function summarizeDocument() {
+  setStatus("Asking AI to create presentation annotations...", 62);
+  const response = await fetch(`${API_BASE}/fn/summarize-document`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: state.file.name,
+      title: state.file.name.replace(/\.pdf$/i, ""),
+      fileObjectId: state.objectId,
+      pages: state.pages,
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Summarization failed");
+  state.annotations = data.annotations || [];
+  els.docTitle.textContent = data.document?.title || state.file.name;
+  els.docSubtitle.textContent = `${data.stats?.summarizedParagraphs || 0} long paragraphs transformed into clickable notes.`;
+}
+
+function getReplacementRegions(pageData, pageAnnotations) {
+  const annotationsBySource = new Map();
+  pageAnnotations.forEach((annotation) => {
+    (annotation.sourceItemIds || []).forEach((sourceId) => {
+      if (!annotationsBySource.has(sourceId)) annotationsBySource.set(sourceId, []);
+      annotationsBySource.get(sourceId).push(annotation);
+    });
+  });
+
+  return pageData.items
+    .filter((item) => item.kind === "paragraph" && annotationsBySource.has(item.id))
+    .map((item) => {
+      const relatedAnnotations = annotationsBySource.get(item.id) || [];
+      const boxes = [item, ...relatedAnnotations];
+      const left = Math.min(...boxes.map((box) => box.x));
+      const top = Math.min(...boxes.map((box) => box.y));
+      const right = Math.max(...boxes.map((box) => box.x + box.width));
+      const bottom = Math.max(...boxes.map((box) => box.y + Math.max(box.height || 0, 22)));
+      const paddingX = Math.max(18, item.fontSize * 1.2);
+      const paddingY = Math.max(10, item.fontSize * 0.9);
+      const paddedLeft = Math.max(0, left - paddingX);
+      const paddedTop = Math.max(0, top - paddingY);
+      const expandedSourceRight = paddedLeft + item.width * 1.35 + paddingX;
+      const paddedRight = Math.min(pageData.width, Math.max(right + paddingX, expandedSourceRight));
+      const paddedBottom = Math.min(pageData.height, Math.max(bottom + paddingY, item.y + item.height + paddingY));
+
+      return {
+        x: paddedLeft,
+        y: paddedTop,
+        width: paddedRight - paddedLeft,
+        height: paddedBottom - paddedTop,
+      };
+    });
+}
+
+async function renderPdfPages() {
+  const pdf = state.pdf;
+  els.pages.innerHTML = "";
+  for (let i = 1; i <= pdf.numPages; i += 1) {
+    setStatus(`Rendering presentation page ${i} of ${pdf.numPages}...`, 82 + (i / pdf.numPages) * 14);
+    const page = await pdf.getPage(i);
+    const pageData = state.pages[i - 1];
+    const viewport = page.getViewport({ scale: 1.35 });
+
+    const pageEl = document.createElement("article");
+    pageEl.className = "page";
+    pageEl.style.width = `${viewport.width}px`;
+    pageEl.style.height = `${viewport.height}px`;
+    pageEl.style.transform = `scale(${state.scale})`;
+    pageEl.style.marginBottom = `${(state.scale - 1) * viewport.height}px`;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const canvasContext = canvas.getContext("2d");
+    await page.render({ canvasContext, viewport }).promise;
+    const pageAnnotations = state.annotations.filter((annotation) => annotation.pageNumber === i);
+    const replacementRegions = getReplacementRegions(pageData, pageAnnotations);
+    canvasContext.fillStyle = "#ffffff";
+    replacementRegions.forEach((region) => {
+      canvasContext.fillRect(region.x, region.y, region.width, region.height);
+    });
+    pageEl.appendChild(canvas);
+
+    replacementRegions
+      .forEach((region) => {
+        const cover = document.createElement("div");
+        cover.className = "cover";
+        cover.style.left = `${region.x}px`;
+        cover.style.top = `${region.y}px`;
+        cover.style.width = `${region.width}px`;
+        cover.style.height = `${region.height}px`;
+        pageEl.appendChild(cover);
+      });
+
+    pageAnnotations.forEach((annotation) => pageEl.appendChild(createAnnotation(annotation)));
+
+    els.pages.appendChild(pageEl);
+  }
+  setStatus("Presentation ready.", 100);
+}
+
+function createAnnotation(annotation) {
+  const button = document.createElement("button");
+  button.className = `annotation ${annotation.kind}`;
+  button.textContent = annotation.label;
+  button.style.left = `${annotation.x}px`;
+  button.style.top = `${annotation.y}px`;
+  button.style.width = `${annotation.width}px`;
+  button.style.height = `${Math.max(20, annotation.height)}px`;
+  button.style.fontSize = `${annotation.kind === "header" ? 15 : 13}px`;
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    showPopover(button, annotation.originalText);
+  });
+  return button;
+}
+
+function showPopover(anchor, text) {
+  document.querySelectorAll(".source-popover").forEach((el) => el.remove());
+  const popover = els.popoverTemplate.content.firstElementChild.cloneNode(true);
+  popover.querySelector("p").textContent = text;
+  popover.querySelector(".close-popover").addEventListener("click", () => popover.remove());
+  anchor.parentElement.appendChild(popover);
+  const left = Math.min(anchor.offsetLeft, anchor.parentElement.offsetWidth - 440);
+  popover.style.left = `${Math.max(10, left)}px`;
+  popover.style.top = `${anchor.offsetTop + anchor.offsetHeight + 8}px`;
+}
+
+function refreshCounters() {
+  els.fileName.textContent = state.file?.name || "None";
+  els.pageCount.textContent = String(state.pages.length);
+  const paragraphs = state.pages.flatMap((page) => page.items).filter((item) => item.kind === "paragraph" && countSentences(item.text) > 2);
+  els.paragraphCount.textContent = String(paragraphs.length);
+}
+
+async function handleFile(file) {
+  if (!file || file.type !== "application/pdf") {
+    setStatus("Choose a valid PDF file.", 0);
+    return;
+  }
+  state.file = file;
+  state.objectId = null;
+  state.annotations = [];
+  els.processButton.disabled = true;
+  els.pages.innerHTML = "";
+  setStatus("Loading PDF...", 5);
+  try {
+    await parsePdf(file);
+    refreshCounters();
+    els.processButton.disabled = false;
+    setStatus("PDF ready. Transform it when you are ready.", 45);
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Could not read PDF.", 0);
+  }
+}
+
+async function processCurrentPdf() {
+  if (!state.file || !state.pages.length) return;
+  els.processButton.disabled = true;
+  try {
+    await uploadPdf(state.file);
+    await summarizeDocument();
+    await renderPdfPages();
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Transform failed.", 0);
+  } finally {
+    els.processButton.disabled = false;
+  }
+}
+
+function renderSample() {
+  const width = 860;
+  const height = 620;
+  state.pdf = null;
+  state.file = { name: "civil-war-sample.pdf" };
+  state.pages = [{
+    pageNumber: 1,
+    width,
+    height,
+    items: [{
+      id: "sample-paragraph",
+      pageNumber: 1,
+      kind: "paragraph",
+      text: sampleText,
+      x: 82,
+      y: 142,
+      width: 690,
+      height: 270,
+      fontSize: 15,
+    }],
+  }];
+  state.annotations = [
+    { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "header", label: "The American Civil War", originalText: sampleText, x: 82, y: 142, width: 690, height: 24 },
+    { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "bullet", label: "The Union vs The Confederacy", originalText: "The American Civil War was a conflict between the northern states, known as the Union, and the southern states, known as the Confederacy, which had seceded from the United States.", x: 98, y: 178, width: 650, height: 22 },
+    { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "bullet", label: "Causes: Slavery, States' Rights", originalText: "The war began in 1861 after years of political, economic, and moral tensions surrounding slavery, states' rights, and the expansion of slavery into western territories. Southern states depended heavily on enslaved labor for their agricultural economy, especially cotton production, while many in the North opposed the spread of slavery. The election of Abraham Lincoln in 1860 intensified these tensions because southern leaders feared his administration would limit slavery.", x: 98, y: 210, width: 650, height: 22 },
+    { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "bullet", label: "During the War", originalText: "Major battles such as Gettysburg, Antietam, and Vicksburg caused enormous casualties and destruction. During the war, Lincoln issued the Emancipation Proclamation, which declared enslaved people in Confederate states to be free and shifted the war's purpose toward ending slavery.", x: 98, y: 242, width: 650, height: 22 },
+    { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "bullet", label: "Results", originalText: "The Union eventually defeated the Confederacy in 1865 due to its stronger industry, transportation systems, and larger population. The Civil War resulted in the abolition of slavery through the Thirteenth Amendment and permanently strengthened the federal government's authority over the states.", x: 98, y: 274, width: 650, height: 22 },
+  ];
+  els.docTitle.textContent = "Civil War Sample";
+  els.docSubtitle.textContent = "Example transformation with clickable source windows.";
+  refreshCounters();
+
+  els.pages.innerHTML = "";
+  const pageEl = document.createElement("article");
+  pageEl.className = "page";
+  pageEl.style.width = `${width}px`;
+  pageEl.style.height = `${height}px`;
+  pageEl.style.transform = `scale(${state.scale})`;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, width, height);
+  ctx.fillStyle = "#1f2933";
+  ctx.font = "800 34px Arial";
+  ctx.fillText("History Notes", 82, 92);
+  ctx.font = "15px Arial";
+  wrapCanvasText(ctx, sampleText, 82, 150, 690, 22);
+  const replacementRegions = getReplacementRegions(state.pages[0], state.annotations);
+  ctx.fillStyle = "#fff";
+  replacementRegions.forEach((region) => {
+    ctx.fillRect(region.x, region.y, region.width, region.height);
+  });
+  pageEl.appendChild(canvas);
+  replacementRegions.forEach((region) => {
+    const cover = document.createElement("div");
+    cover.className = "cover";
+    cover.style.left = `${region.x}px`;
+    cover.style.top = `${region.y}px`;
+    cover.style.width = `${region.width}px`;
+    cover.style.height = `${region.height}px`;
+    pageEl.appendChild(cover);
+  });
+  state.annotations.forEach((annotation) => pageEl.appendChild(createAnnotation(annotation)));
+  els.pages.appendChild(pageEl);
+  setStatus("Sample ready.", 100);
+}
+
+function wrapCanvasText(ctx, text, x, y, maxWidth, lineHeight) {
+  const words = text.split(/\s+/);
+  let line = "";
+  words.forEach((word) => {
+    const test = `${line}${word} `;
+    if (ctx.measureText(test).width > maxWidth) {
+      ctx.fillText(line, x, y);
+      line = `${word} `;
+      y += lineHeight;
+    } else {
+      line = test;
+    }
+  });
+  ctx.fillText(line, x, y);
+}
+
+function setZoom(nextScale) {
+  state.scale = Math.max(0.55, Math.min(1.45, nextScale));
+  els.zoomLabel.textContent = `${Math.round(state.scale * 100)}%`;
+  document.querySelectorAll(".page").forEach((page) => {
+    page.style.transform = `scale(${state.scale})`;
+  });
+}
+
+els.input.addEventListener("change", (event) => handleFile(event.target.files[0]));
+els.processButton.addEventListener("click", processCurrentPdf);
+els.sampleButton.addEventListener("click", renderSample);
+els.zoomIn.addEventListener("click", () => setZoom(state.scale + 0.1));
+els.zoomOut.addEventListener("click", () => setZoom(state.scale - 0.1));
+document.addEventListener("click", () => document.querySelectorAll(".source-popover").forEach((el) => el.remove()));
+
+["dragenter", "dragover"].forEach((eventName) => {
+  els.dropZone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    els.dropZone.classList.add("dragover");
+  });
+});
+
+["dragleave", "drop"].forEach((eventName) => {
+  els.dropZone.addEventListener(eventName, (event) => {
+    event.preventDefault();
+    els.dropZone.classList.remove("dragover");
+  });
+});
+
+els.dropZone.addEventListener("drop", (event) => handleFile(event.dataTransfer.files[0]));
