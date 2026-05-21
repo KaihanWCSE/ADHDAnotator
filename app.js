@@ -55,15 +55,26 @@ function countSentences(text) {
   return (text.match(/[.!?]+(?=\s|$)/g) || []).length;
 }
 
+function repairPdfExtractedText(text) {
+  return String(text || "")
+    .replace(/\ufb00/g, "ff")
+    .replace(/\ufb01/g, "fi")
+    .replace(/\ufb02/g, "fl")
+    .replace(/\ufb03/g, "ffi")
+    .replace(/\ufb04/g, "ffl")
+    .replace(/\u01af/g, "ff")
+    .replace(/\b([A-Za-z]+)-\s+([A-Za-z]+)\b/g, "$1-$2")
+    .replace(/\b([Ee])\s*ff\s+ect/g, "$1ffect")
+    .replace(/\b([Ee])\s*ff\s+ort/g, "$1ffort");
+}
+
 function normalizeText(text) {
-  return text.replace(/\s+/g, " ").trim();
+  return repairPdfExtractedText(text).replace(/\s+/g, " ").trim();
 }
 
 function normalizeForMatch(text) {
   return normalizeText(text)
     .toLowerCase()
-    .replace(/[\ufb01]/g, "fi")
-    .replace(/[\ufb02]/g, "fl")
     .replace(/[^\w\s]/g, " ");
 }
 
@@ -380,6 +391,18 @@ function mockPlanForParagraph(text) {
     };
   }
 
+  if (normalized.includes("recognize and validate my emotions") && normalized.includes("self discovery")) {
+    const growthStart = findSentenceIndex(sentences, "So, Mindful Journaling");
+    const splitAt = growthStart > 0 ? growthStart : Math.ceil(sentences.length / 2);
+    return {
+      header: "Benefits of Mindful Journaling",
+      chunks: chunkBySentenceRanges(sentences, [
+        ["Recognizing Emotional Patterns", 0, splitAt],
+        ["Turning Challenge into Growth", splitAt, sentences.length],
+      ]),
+    };
+  }
+
   if (normalized.includes("nonjudgmentally") && normalized.includes("one mindfully") && normalized.includes("journaling")) {
     const oneMindfully = findSentenceIndex(sentences, "One-Mindfully");
     const effectively = Math.max(
@@ -394,18 +417,6 @@ function mockPlanForParagraph(text) {
         ["Nonjudgmental Acceptance", 0, secondStart],
         ["One-Mindful Focus", secondStart, thirdStart],
         ["Effective Action Steps", thirdStart, sentences.length],
-      ]),
-    };
-  }
-
-  if (normalized.includes("recognize and validate my emotions") && normalized.includes("self discovery")) {
-    const growthStart = findSentenceIndex(sentences, "So, Mindful Journaling");
-    const splitAt = growthStart > 0 ? growthStart : Math.ceil(sentences.length / 2);
-    return {
-      header: "Benefits of Mindful Journaling",
-      chunks: chunkBySentenceRanges(sentences, [
-        ["Recognizing Emotional Patterns", 0, splitAt],
-        ["Turning Challenge into Growth", splitAt, sentences.length],
       ]),
     };
   }
