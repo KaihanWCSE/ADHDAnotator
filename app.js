@@ -4,6 +4,7 @@ const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.wor
 const BUILD_ID = "local-mock-ai-2026-05-21";
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
 const USE_MOCK_AI = true;
+const DEFAULT_MOCK_PDF = "test-fixtures/mockTest.pdf";
 
 window.PDF_ANNOTATOR_BUILD_ID = BUILD_ID;
 document.documentElement.dataset.build = BUILD_ID;
@@ -885,13 +886,17 @@ async function processCurrentPdf() {
 }
 
 async function autoloadLocalMockPdf() {
-  if (!USE_MOCK_AI || !["127.0.0.1", "localhost"].includes(window.location.hostname)) return;
+  if (!USE_MOCK_AI) return;
 
-  const filename = new URLSearchParams(window.location.search).get("autoload");
+  const params = new URLSearchParams(window.location.search);
+  const isLocalHost = ["127.0.0.1", "localhost"].includes(window.location.hostname);
+  const isButterbaseHost = window.location.hostname === "pdf-annotator-ai.butterbase.dev";
+  if (!isLocalHost && !isButterbaseHost) return;
+
+  const filename = params.get("autoload") || (isButterbaseHost ? DEFAULT_MOCK_PDF : "");
   if (!filename) return;
 
   try {
-    const params = new URLSearchParams(window.location.search);
     const response = await fetch(filename);
     if (!response.ok) throw new Error(`Could not load ${filename}`);
     const blob = await response.blob();

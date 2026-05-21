@@ -9,3 +9,9 @@ http://127.0.0.1:4177/?autoload=test-fixtures/mockTest.pdf
 ```
 
 `test-fixtures/mockTest.pdf` is a regression fixture for the local mock AI flow, PDF text cleanup, annotation placement, and source popovers.
+
+The Butterbase demo URL currently auto-loads the same mock PDF fixture so the submitted project can be reviewed without AI credits:
+
+```text
+https://pdf-annotator-ai.butterbase.dev
+```
