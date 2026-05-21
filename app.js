@@ -62,6 +62,38 @@ function lineKey(y) {
   return Math.round(y / 4) * 4;
 }
 
+function getFontFamily(fontName, textContent) {
+  const family = textContent.styles?.[fontName]?.fontFamily || fontName || "";
+  if (/courier|mono/i.test(family)) return "Courier New, monospace";
+  if (/times|serif/i.test(family)) return "Times New Roman, Georgia, serif";
+  return "Arial, Helvetica, sans-serif";
+}
+
+function getFontWeight(fontName) {
+  return /bold|black|heavy|semibold|demi/i.test(fontName || "") ? 700 : 400;
+}
+
+function getFontStyle(fontName) {
+  return /italic|oblique/i.test(fontName || "") ? "italic" : "normal";
+}
+
+function textBlocksOverlap(a, b) {
+  const left = Math.max(a.x, b.x);
+  const right = Math.min(a.x + a.width, b.x + b.width);
+  const overlap = Math.max(0, right - left);
+  return overlap / Math.max(1, Math.min(a.width, b.width));
+}
+
+function isSameTextColumn(current, line, medianFont) {
+  if (!current) return false;
+  const currentBox = { x: current.x, width: current.width };
+  return Math.abs(line.x - current.x) < medianFont * 5 || textBlocksOverlap(currentBox, line) > 0.28;
+}
+
+function getCurrentBlockText(current) {
+  return normalizeText(current.lines.map((line) => line.text).join(" "));
+}
+
 function classifyBlock(block, medianFont) {
   const text = block.text.trim();
   if (/^(\u2022|[-*]|[0-9]+[.)])\s+/.test(text)) return "bullet";
@@ -93,6 +125,10 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
         width: Math.max(item.width || text.length * fontSize * 0.42, 8),
         height: fontSize * 1.35,
         fontSize,
+        fontFamily: getFontFamily(item.fontName, textContent),
+        fontName: item.fontName || "",
+        fontStyle: getFontStyle(item.fontName),
+        fontWeight: getFontWeight(item.fontName),
         textLength: text.length,
       };
     })
@@ -124,11 +160,16 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
         fontSize: median(ordered.map((span) => span.fontSize)),
         textLength: text.length,
         segments: ordered.map((span) => ({
+          id: span.id,
           x: span.x,
           y: span.y,
           width: span.width,
           height: span.height,
           fontSize: span.fontSize,
+          fontFamily: span.fontFamily,
+          fontName: span.fontName,
+          fontStyle: span.fontStyle,
+          fontWeight: span.fontWeight,
           text: span.text,
           textLength: span.textLength,
         })),
@@ -152,19 +193,24 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
       textLength: line.textLength,
       segments: line.segments,
     }));
+    current.spanIds = current.lineBoxes.flatMap((line) => line.segments.map((segment) => segment.id));
     current.kind = classifyBlock(current, medianFont);
     delete current.lines;
     blocks.push(current);
     current = null;
   };
 
-  lines.forEach((line, index) => {
-    const previous = lines[index - 1];
-    const gap = previous ? line.y - (previous.y + previous.height) : 999;
-    const sameColumn = previous ? Math.abs(line.x - previous.x) < 32 : false;
-    const lineLooksStandalone = classifyBlock(line, medianFont) !== "text";
+  lines.forEach((line) => {
+    const lastLine = current?.lines[current.lines.length - 1];
+    const gap = lastLine ? line.y - (lastLine.y + lastLine.height) : 999;
+    const sameColumn = isSameTextColumn(current, line, medianFont);
+    const lineKind = classifyBlock(line, medianFont);
+    const currentKind = current ? classifyBlock({ ...current, text: getCurrentBlockText(current) }, medianFont) : null;
+    const lineLooksStandalone = lineKind !== "text";
+    const normalTextFlow = sameColumn && gap <= medianFont * 2.15;
+    const continuationTextFlow = sameColumn && currentKind === "text" && lineKind === "text" && gap <= medianFont * 5.5;
 
-    if (!current || lineLooksStandalone || gap > medianFont * 1.4 || !sameColumn) {
+    if (!current || lineLooksStandalone || (!normalTextFlow && !continuationTextFlow)) {
       flush();
       current = {
         id: `p${pageNumber}-b${blocks.length}`,
@@ -190,14 +236,17 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
   });
   flush();
 
-  return blocks.map((block) => ({
-    ...block,
-    x: Math.max(0, block.x - 2),
-    y: Math.max(0, block.y - 2),
-    width: Math.min(viewport.width - block.x, block.width + 6),
-    height: block.height + 4,
-    textLength: block.text.length,
-  }));
+  return {
+    items: blocks.map((block) => ({
+      ...block,
+      x: Math.max(0, block.x - 2),
+      y: Math.max(0, block.y - 2),
+      width: Math.min(viewport.width - block.x, block.width + 6),
+      height: block.height + 4,
+      textLength: block.text.length,
+    })),
+    textSpans: spans,
+  };
 }
 
 async function parsePdf(file) {
@@ -212,12 +261,13 @@ async function parsePdf(file) {
     const page = await pdf.getPage(pageNumber);
     const viewport = page.getViewport({ scale: 1.35 });
     const textContent = await page.getTextContent();
-    const items = extractBlocksFromTextContent(textContent, viewport, pageNumber);
+    const pageText = extractBlocksFromTextContent(textContent, viewport, pageNumber);
     state.pages.push({
       pageNumber,
       width: viewport.width,
       height: viewport.height,
-      items,
+      items: pageText.items,
+      textSpans: pageText.textSpans,
     });
   }
 }
@@ -246,6 +296,18 @@ async function uploadPdf(file) {
   state.objectId = uploadData.objectId;
 }
 
+function getSummarizationPages() {
+  return state.pages.map(({ pageNumber, width, height, items }) => ({
+    pageNumber,
+    width,
+    height,
+    items: items.map(({ lineBoxes, spanIds, textLength, ...item }) => ({
+      ...item,
+      textLength,
+    })),
+  }));
+}
+
 async function summarizeDocument() {
   setStatus("Asking AI to create presentation annotations...", 62);
   const response = await fetch(`${API_BASE}/fn/summarize-document`, {
@@ -255,7 +317,7 @@ async function summarizeDocument() {
       filename: state.file.name,
       title: state.file.name.replace(/\.pdf$/i, ""),
       fileObjectId: state.objectId,
-      pages: state.pages,
+      pages: getSummarizationPages(),
     }),
   });
   const data = await response.json();
@@ -301,6 +363,69 @@ function getSourceLines(source) {
     text: index === 0 ? source.text : "",
     textLength: index === 0 ? source.text.length : 0,
   }));
+}
+
+function getSourceSpanIds(source) {
+  if (source.spanIds?.length) return source.spanIds;
+  return getSourceLines(source).flatMap((line) => (line.segments || []).map((segment) => segment.id)).filter(Boolean);
+}
+
+function getSkippedTextSpanIds(pageData, pageAnnotations) {
+  const skipped = new Set();
+  getSourceReplacements(pageData, pageAnnotations).forEach(({ source }) => {
+    getSourceSpanIds(source).forEach((spanId) => skipped.add(spanId));
+  });
+  return skipped;
+}
+
+function setOriginalTextFont(ctx, span) {
+  const fontStyle = span.fontStyle || "normal";
+  const fontWeight = span.fontWeight || 400;
+  const fontSize = Math.max(8, span.fontSize || 12);
+  const fontFamily = span.fontFamily || "Arial, Helvetica, sans-serif";
+  ctx.font = `${fontStyle} ${fontWeight} ${fontSize}px ${fontFamily}`;
+}
+
+function getTextSpanWidth(ctx, span) {
+  setOriginalTextFont(ctx, span);
+  const measuredWidth = ctx.measureText(span.text || "").width;
+  const estimatedWidth = (span.textLength || (span.text || "").length) * Math.max(8, span.fontSize || 12) * 0.48;
+  return Math.max(span.width || 0, measuredWidth, estimatedWidth, 4);
+}
+
+function eraseTextSpans(ctx, pageData) {
+  if (!pageData.textSpans?.length) return;
+
+  ctx.save();
+  ctx.fillStyle = "#ffffff";
+  pageData.textSpans.forEach((span) => {
+    const fontSize = Math.max(8, span.fontSize || 12);
+    const padX = Math.max(2, fontSize * 0.18);
+    const padTop = Math.max(2, fontSize * 0.25);
+    const padBottom = Math.max(3, fontSize * 0.32);
+    const x = Math.max(0, span.x - padX);
+    const y = Math.max(0, span.y - padTop);
+    const right = Math.min(pageData.width, span.x + getTextSpanWidth(ctx, span) + padX);
+    const bottom = Math.min(pageData.height, span.y + Math.max(span.height, fontSize * 1.35) + padBottom);
+    ctx.fillRect(x, y, right - x, bottom - y);
+  });
+  ctx.restore();
+}
+
+function drawOriginalTextSpans(ctx, pageData, skippedSpanIds) {
+  if (!pageData.textSpans?.length) return;
+
+  ctx.save();
+  ctx.fillStyle = "#1f2933";
+  ctx.textBaseline = "alphabetic";
+  pageData.textSpans
+    .filter((span) => !skippedSpanIds.has(span.id))
+    .sort((a, b) => a.y - b.y || a.x - b.x)
+    .forEach((span) => {
+      setOriginalTextFont(ctx, span);
+      ctx.fillText(span.text, span.x, span.y + Math.max(8, span.fontSize || 12), getTextSpanWidth(ctx, span));
+    });
+  ctx.restore();
 }
 
 function getCanvasLabel(annotation) {
@@ -433,8 +558,9 @@ async function renderPdfPages() {
     const canvasContext = canvas.getContext("2d");
     await page.render({ canvasContext, viewport }).promise;
     const pageAnnotations = state.annotations.filter((annotation) => annotation.pageNumber === i);
-    const sourceReplacements = getSourceReplacements(pageData, pageAnnotations);
-    sourceReplacements.forEach(({ source }) => eraseSourceText(canvasContext, source, pageData));
+    const skippedSpanIds = getSkippedTextSpanIds(pageData, pageAnnotations);
+    eraseTextSpans(canvasContext, pageData);
+    drawOriginalTextSpans(canvasContext, pageData, skippedSpanIds);
     const positionedAnnotations = layoutReplacementAnnotations(pageData, pageAnnotations);
     drawReplacementTexts(canvasContext, positionedAnnotations);
     pageEl.appendChild(canvas);
