@@ -93,6 +93,7 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
         width: Math.max(item.width || text.length * fontSize * 0.42, 8),
         height: fontSize * 1.35,
         fontSize,
+        textLength: text.length,
       };
     })
     .filter(Boolean);
@@ -121,6 +122,16 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
         width: right - x,
         height: bottom - y,
         fontSize: median(ordered.map((span) => span.fontSize)),
+        textLength: text.length,
+        segments: ordered.map((span) => ({
+          x: span.x,
+          y: span.y,
+          width: span.width,
+          height: span.height,
+          fontSize: span.fontSize,
+          text: span.text,
+          textLength: span.textLength,
+        })),
       };
     })
     .sort((a, b) => a.y - b.y || a.x - b.x);
@@ -131,6 +142,16 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
   const flush = () => {
     if (!current) return;
     current.text = normalizeText(current.lines.map((line) => line.text).join(" "));
+    current.lineBoxes = current.lines.map((line) => ({
+      x: line.x,
+      y: line.y,
+      width: line.width,
+      height: line.height,
+      fontSize: line.fontSize,
+      text: line.text,
+      textLength: line.textLength,
+      segments: line.segments,
+    }));
     current.kind = classifyBlock(current, medianFont);
     delete current.lines;
     blocks.push(current);
@@ -175,6 +196,7 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
     y: Math.max(0, block.y - 2),
     width: Math.min(viewport.width - block.x, block.width + 6),
     height: block.height + 4,
+    textLength: block.text.length,
   }));
 }
 
@@ -243,7 +265,7 @@ async function summarizeDocument() {
   els.docSubtitle.textContent = `${data.stats?.summarizedParagraphs || 0} long paragraphs transformed into clickable notes.`;
 }
 
-function getReplacementRegions(pageData, pageAnnotations) {
+function getAnnotationsBySource(pageAnnotations) {
   const annotationsBySource = new Map();
   pageAnnotations.forEach((annotation) => {
     (annotation.sourceItemIds || []).forEach((sourceId) => {
@@ -251,31 +273,142 @@ function getReplacementRegions(pageData, pageAnnotations) {
       annotationsBySource.get(sourceId).push(annotation);
     });
   });
+  return annotationsBySource;
+}
+
+function getSourceReplacements(pageData, pageAnnotations) {
+  const annotationsBySource = getAnnotationsBySource(pageAnnotations);
 
   return pageData.items
     .filter((item) => item.kind === "paragraph" && annotationsBySource.has(item.id))
-    .map((item) => {
-      const relatedAnnotations = annotationsBySource.get(item.id) || [];
-      const boxes = [item, ...relatedAnnotations];
-      const left = Math.min(...boxes.map((box) => box.x));
-      const top = Math.min(...boxes.map((box) => box.y));
-      const right = Math.max(...boxes.map((box) => box.x + box.width));
-      const bottom = Math.max(...boxes.map((box) => box.y + Math.max(box.height || 0, 22)));
-      const paddingX = Math.max(18, item.fontSize * 1.2);
-      const paddingY = Math.max(10, item.fontSize * 0.9);
-      const paddedLeft = Math.max(0, left - paddingX);
-      const paddedTop = Math.max(0, top - paddingY);
-      const expandedSourceRight = paddedLeft + item.width * 1.35 + paddingX;
-      const paddedRight = Math.min(pageData.width, Math.max(right + paddingX, expandedSourceRight));
-      const paddedBottom = Math.min(pageData.height, Math.max(bottom + paddingY, item.y + item.height + paddingY));
+    .map((source) => ({
+      source,
+      annotations: annotationsBySource.get(source.id) || [],
+    }));
+}
 
-      return {
-        x: paddedLeft,
-        y: paddedTop,
-        width: paddedRight - paddedLeft,
-        height: paddedBottom - paddedTop,
+function getSourceLines(source) {
+  if (source.lineBoxes?.length) return source.lineBoxes;
+
+  const lineHeight = Math.max(18, source.fontSize * 1.45);
+  const lineCount = Math.max(1, Math.ceil(source.height / lineHeight));
+  return Array.from({ length: lineCount }, (_, index) => ({
+    x: source.x,
+    y: source.y + index * lineHeight,
+    width: source.width,
+    height: lineHeight,
+    fontSize: source.fontSize,
+    text: index === 0 ? source.text : "",
+    textLength: index === 0 ? source.text.length : 0,
+  }));
+}
+
+function getCanvasLabel(annotation) {
+  return annotation.kind === "bullet" ? `\u2022 ${annotation.label}` : annotation.label;
+}
+
+function getFixedLengthReplacement(annotation, sourceText) {
+  const label = normalizeText(getCanvasLabel(annotation));
+  const sourceLength = Math.max(label.length, sourceText?.length || 0);
+  return label.padEnd(sourceLength, " ");
+}
+
+function getLineTextWidth(ctx, line) {
+  const fontSize = Math.max(8, line.fontSize || 12);
+  ctx.font = `${fontSize}px "Times New Roman", Georgia, serif`;
+  const measuredWidth = ctx.measureText(line.text || "").width;
+  const estimatedWidth = (line.textLength || (line.text || "").length) * fontSize * 0.48;
+  return Math.max(line.width || 0, measuredWidth, estimatedWidth);
+}
+
+function eraseSourceText(ctx, source, pageData) {
+  const lines = getSourceLines(source);
+  const lineRights = lines.map((line) => line.x + getLineTextWidth(ctx, line));
+  const paragraphRight = Math.min(pageData.width, Math.max(source.x + source.width, ...lineRights));
+
+  ctx.save();
+  ctx.fillStyle = "#ffffff";
+  lines.forEach((line) => {
+    const fontSize = Math.max(8, line.fontSize || source.fontSize || 12);
+    const padLeft = Math.max(3, fontSize * 0.25);
+    const padRight = Math.max(8, fontSize * 0.75);
+    const padTop = Math.max(2, fontSize * 0.2);
+    const padBottom = Math.max(4, fontSize * 0.35);
+    const clearX = Math.max(0, line.x - padLeft);
+    const clearY = Math.max(0, line.y - padTop);
+    const lineRight = line.x + getLineTextWidth(ctx, line) + padRight;
+    const clearRight = Math.min(pageData.width, Math.max(lineRight, paragraphRight + padRight));
+    const clearBottom = Math.min(pageData.height, line.y + Math.max(line.height, fontSize * 1.35) + padBottom);
+    ctx.fillRect(clearX, clearY, clearRight - clearX, clearBottom - clearY);
+  });
+  ctx.restore();
+}
+
+function layoutReplacementAnnotations(pageData, pageAnnotations) {
+  const replacements = getSourceReplacements(pageData, pageAnnotations);
+  const positioned = [];
+  const replacedAnnotations = new Set();
+
+  replacements.forEach(({ source, annotations }) => {
+    const lines = getSourceLines(source);
+    const orderedAnnotations = [...annotations].sort((a, b) => a.y - b.y || a.x - b.x);
+    const lineHeight = median(lines.map((line) => line.height));
+    const fontSize = Math.max(11, source.fontSize || median(lines.map((line) => line.fontSize)));
+
+    orderedAnnotations.forEach((annotation, index) => {
+      replacedAnnotations.add(annotation);
+      const line = lines[index] || {
+        x: source.x,
+        y: source.y + index * lineHeight,
+        width: source.width,
+        height: lineHeight,
+        fontSize,
+        text: "",
+        textLength: 0,
       };
+      const indent = annotation.kind === "bullet" ? Math.max(10, fontSize * 0.9) : 0;
+      positioned.push({
+        ...annotation,
+        x: line.x + indent,
+        y: line.y,
+        width: Math.max(24, line.width - indent),
+        height: Math.max(18, line.height),
+        fontSize: annotation.kind === "header" ? Math.max(14, fontSize * 1.08) : Math.max(12, fontSize * 0.96),
+        replacementText: getFixedLengthReplacement(annotation, line.text || source.text),
+      });
     });
+  });
+
+  pageAnnotations.forEach((annotation) => {
+    if (!replacedAnnotations.has(annotation)) {
+      positioned.push({
+        ...annotation,
+        fontSize: annotation.kind === "header" ? 15 : 13,
+        replacementText: getFixedLengthReplacement(annotation, annotation.originalText || ""),
+      });
+    }
+  });
+
+  return positioned;
+}
+
+function drawReplacementText(ctx, annotation) {
+  const label = (annotation.replacementText || getCanvasLabel(annotation)).trimEnd();
+  const fontSize = annotation.fontSize || (annotation.kind === "header" ? 15 : 13);
+  const weight = annotation.kind === "header" ? 800 : 650;
+  const color = annotation.kind === "header" ? "#2563eb" : "#9f1239";
+  const baseline = annotation.y + Math.min(Math.max(fontSize + 2, annotation.height * 0.78), annotation.height - 2);
+
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.font = `${weight} ${fontSize}px Inter, Arial, sans-serif`;
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(label, annotation.x, baseline, annotation.width);
+  ctx.restore();
+}
+
+function drawReplacementTexts(ctx, annotations) {
+  annotations.forEach((annotation) => drawReplacementText(ctx, annotation));
 }
 
 async function renderPdfPages() {
@@ -300,25 +433,13 @@ async function renderPdfPages() {
     const canvasContext = canvas.getContext("2d");
     await page.render({ canvasContext, viewport }).promise;
     const pageAnnotations = state.annotations.filter((annotation) => annotation.pageNumber === i);
-    const replacementRegions = getReplacementRegions(pageData, pageAnnotations);
-    canvasContext.fillStyle = "#ffffff";
-    replacementRegions.forEach((region) => {
-      canvasContext.fillRect(region.x, region.y, region.width, region.height);
-    });
+    const sourceReplacements = getSourceReplacements(pageData, pageAnnotations);
+    sourceReplacements.forEach(({ source }) => eraseSourceText(canvasContext, source, pageData));
+    const positionedAnnotations = layoutReplacementAnnotations(pageData, pageAnnotations);
+    drawReplacementTexts(canvasContext, positionedAnnotations);
     pageEl.appendChild(canvas);
 
-    replacementRegions
-      .forEach((region) => {
-        const cover = document.createElement("div");
-        cover.className = "cover";
-        cover.style.left = `${region.x}px`;
-        cover.style.top = `${region.y}px`;
-        cover.style.width = `${region.width}px`;
-        cover.style.height = `${region.height}px`;
-        pageEl.appendChild(cover);
-      });
-
-    pageAnnotations.forEach((annotation) => pageEl.appendChild(createAnnotation(annotation)));
+    positionedAnnotations.forEach((annotation) => pageEl.appendChild(createAnnotation(annotation)));
 
     els.pages.appendChild(pageEl);
   }
@@ -328,12 +449,13 @@ async function renderPdfPages() {
 function createAnnotation(annotation) {
   const button = document.createElement("button");
   button.className = `annotation ${annotation.kind}`;
-  button.textContent = annotation.label;
+  button.type = "button";
+  button.setAttribute("aria-label", `Show original text for ${annotation.label}`);
+  button.title = annotation.label;
   button.style.left = `${annotation.x}px`;
   button.style.top = `${annotation.y}px`;
   button.style.width = `${annotation.width}px`;
   button.style.height = `${Math.max(20, annotation.height)}px`;
-  button.style.fontSize = `${annotation.kind === "header" ? 15 : 13}px`;
   button.addEventListener("click", (event) => {
     event.stopPropagation();
     showPopover(button, annotation.originalText);
@@ -445,22 +567,12 @@ function renderSample() {
   ctx.fillText("History Notes", 82, 92);
   ctx.font = "15px Arial";
   wrapCanvasText(ctx, sampleText, 82, 150, 690, 22);
-  const replacementRegions = getReplacementRegions(state.pages[0], state.annotations);
-  ctx.fillStyle = "#fff";
-  replacementRegions.forEach((region) => {
-    ctx.fillRect(region.x, region.y, region.width, region.height);
-  });
+  const sourceReplacements = getSourceReplacements(state.pages[0], state.annotations);
+  sourceReplacements.forEach(({ source }) => eraseSourceText(ctx, source, state.pages[0]));
+  const positionedAnnotations = layoutReplacementAnnotations(state.pages[0], state.annotations);
+  drawReplacementTexts(ctx, positionedAnnotations);
   pageEl.appendChild(canvas);
-  replacementRegions.forEach((region) => {
-    const cover = document.createElement("div");
-    cover.className = "cover";
-    cover.style.left = `${region.x}px`;
-    cover.style.top = `${region.y}px`;
-    cover.style.width = `${region.width}px`;
-    cover.style.height = `${region.height}px`;
-    pageEl.appendChild(cover);
-  });
-  state.annotations.forEach((annotation) => pageEl.appendChild(createAnnotation(annotation)));
+  positionedAnnotations.forEach((annotation) => pageEl.appendChild(createAnnotation(annotation)));
   els.pages.appendChild(pageEl);
   setStatus("Sample ready.", 100);
 }

@@ -281,46 +281,20 @@ p {
   height: 100%;
 }
 
-.cover {
-  position: absolute;
-  z-index: 1;
-  background: #ffffff;
-}
-
 .annotation {
   position: absolute;
   z-index: 2;
-  display: flex;
-  align-items: center;
-  min-height: 18px;
-  padding: 1px 4px;
+  padding: 0;
   border: 0;
   border-radius: 4px;
   background: transparent;
-  color: var(--blue);
-  text-align: left;
-  line-height: 1.25;
   cursor: pointer;
 }
 
 .annotation:hover,
 .annotation:focus-visible {
-  background: #dbeafe;
+  background: rgba(219, 234, 254, 0.46);
   outline: 2px solid rgba(37, 99, 235, 0.32);
-}
-
-.annotation.header {
-  font-weight: 850;
-}
-
-.annotation.bullet {
-  color: #9f1239;
-  font-weight: 650;
-}
-
-.annotation.bullet::before {
-  content: "\2022";
-  margin-right: 6px;
 }
 
 .source-popover {
