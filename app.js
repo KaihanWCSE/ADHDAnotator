@@ -2,6 +2,7 @@ const APP_ID = "app_jnnlkgx7ehdy";
 const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
 const BUILD_ID = "semantic-chunks-2026-05-21";
+const MAX_PDF_BYTES = 10 * 1024 * 1024;
 
 window.PDF_ANNOTATOR_BUILD_ID = BUILD_ID;
 document.documentElement.dataset.build = BUILD_ID;
@@ -293,6 +294,10 @@ async function parsePdf(file) {
 }
 
 async function uploadPdf(file) {
+  if (file.size < 1 || file.size > MAX_PDF_BYTES) {
+    throw new Error("PDF must be between 1 byte and 10 MB.");
+  }
+
   setStatus("Creating secure upload URL...", 46);
   const uploadResponse = await fetch(`${API_BASE}/fn/create-pdf-upload`, {
     method: "POST",
@@ -636,6 +641,18 @@ function refreshCounters() {
 async function handleFile(file) {
   if (!file || file.type !== "application/pdf") {
     setStatus("Choose a valid PDF file.", 0);
+    return;
+  }
+  if (file.size < 1 || file.size > MAX_PDF_BYTES) {
+    state.file = null;
+    state.objectId = null;
+    state.annotations = [];
+    els.processButton.disabled = true;
+    els.pages.innerHTML = "";
+    els.fileName.textContent = file.name || "None";
+    els.pageCount.textContent = "0";
+    els.paragraphCount.textContent = "0";
+    setStatus("PDF must be between 1 byte and 10 MB.", 0);
     return;
   }
   state.file = file;
