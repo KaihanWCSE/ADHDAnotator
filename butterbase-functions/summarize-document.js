@@ -202,7 +202,7 @@ export async function handler(req, ctx) {
         const plan = await makeSemanticPlan(ctx, item);
         let rowIndex = 0;
         if (plan.header) {
-          annotations.push(annotationFromItem(item, "header", plan.header, item.text, rowIndex));
+          annotations.push(annotationFromItem(item, "header", plan.header, "", rowIndex));
           rowIndex += 1;
         }
 

@@ -1,7 +1,7 @@
 const APP_ID = "app_jnnlkgx7ehdy";
 const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
-const BUILD_ID = "viewport-transform-2026-05-20";
+const BUILD_ID = "semantic-chunks-2026-05-21";
 
 window.PDF_ANNOTATOR_BUILD_ID = BUILD_ID;
 document.documentElement.dataset.build = BUILD_ID;
@@ -586,7 +586,10 @@ async function renderPdfPages() {
     drawReplacementTexts(canvasContext, positionedAnnotations);
     pageEl.appendChild(canvas);
 
-    positionedAnnotations.forEach((annotation) => pageEl.appendChild(createAnnotation(annotation)));
+    positionedAnnotations.forEach((annotation) => {
+      const annotationButton = createAnnotation(annotation);
+      if (annotationButton) pageEl.appendChild(annotationButton);
+    });
 
     els.pages.appendChild(pageEl);
   }
@@ -594,6 +597,8 @@ async function renderPdfPages() {
 }
 
 function createAnnotation(annotation) {
+  if (!annotation.originalText) return null;
+
   const button = document.createElement("button");
   button.className = `annotation ${annotation.kind}`;
   button.type = "button";
@@ -687,7 +692,7 @@ function renderSample() {
     }],
   }];
   state.annotations = [
-    { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "header", label: "The American Civil War", originalText: sampleText, x: 82, y: 142, width: 690, height: 24 },
+    { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "header", label: "The American Civil War", originalText: "", x: 82, y: 142, width: 690, height: 24 },
     { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "bullet", label: "The Union vs The Confederacy", originalText: "The American Civil War was a conflict between the northern states, known as the Union, and the southern states, known as the Confederacy, which had seceded from the United States.", x: 98, y: 178, width: 650, height: 22 },
     { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "bullet", label: "Causes: Slavery, States' Rights", originalText: "The war began in 1861 after years of political, economic, and moral tensions surrounding slavery, states' rights, and the expansion of slavery into western territories. Southern states depended heavily on enslaved labor for their agricultural economy, especially cotton production, while many in the North opposed the spread of slavery. The election of Abraham Lincoln in 1860 intensified these tensions because southern leaders feared his administration would limit slavery.", x: 98, y: 210, width: 650, height: 22 },
     { pageNumber: 1, sourceItemIds: ["sample-paragraph"], kind: "bullet", label: "During the War", originalText: "Major battles such as Gettysburg, Antietam, and Vicksburg caused enormous casualties and destruction. During the war, Lincoln issued the Emancipation Proclamation, which declared enslaved people in Confederate states to be free and shifted the war's purpose toward ending slavery.", x: 98, y: 242, width: 650, height: 22 },
@@ -719,7 +724,10 @@ function renderSample() {
   const positionedAnnotations = layoutReplacementAnnotations(state.pages[0], state.annotations);
   drawReplacementTexts(ctx, positionedAnnotations);
   pageEl.appendChild(canvas);
-  positionedAnnotations.forEach((annotation) => pageEl.appendChild(createAnnotation(annotation)));
+  positionedAnnotations.forEach((annotation) => {
+    const annotationButton = createAnnotation(annotation);
+    if (annotationButton) pageEl.appendChild(annotationButton);
+  });
   els.pages.appendChild(pageEl);
   setStatus("Sample ready.", 100);
 }
