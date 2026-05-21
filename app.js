@@ -1,6 +1,10 @@
 const APP_ID = "app_jnnlkgx7ehdy";
 const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
+const BUILD_ID = "viewport-transform-2026-05-20";
+
+window.PDF_ANNOTATOR_BUILD_ID = BUILD_ID;
+document.documentElement.dataset.build = BUILD_ID;
 
 const state = {
   file: null,
@@ -56,6 +60,17 @@ function normalizeText(text) {
 function getFontSize(item) {
   const [a, b] = item.transform;
   return Math.max(8, Math.hypot(a, b));
+}
+
+function transformMatrix(matrixA, matrixB) {
+  return [
+    matrixA[0] * matrixB[0] + matrixA[2] * matrixB[1],
+    matrixA[1] * matrixB[0] + matrixA[3] * matrixB[1],
+    matrixA[0] * matrixB[2] + matrixA[2] * matrixB[3],
+    matrixA[1] * matrixB[2] + matrixA[3] * matrixB[3],
+    matrixA[0] * matrixB[4] + matrixA[2] * matrixB[5] + matrixA[4],
+    matrixA[1] * matrixB[4] + matrixA[3] * matrixB[5] + matrixA[5],
+  ];
 }
 
 function lineKey(y) {
@@ -114,15 +129,18 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
     .map((item, index) => {
       const text = normalizeText(item.str || "");
       if (!text) return null;
-      const x = item.transform[4];
-      const y = viewport.height - item.transform[5];
-      const fontSize = getFontSize(item);
+      const textMatrix = transformMatrix(viewport.transform, item.transform);
+      const x = textMatrix[4];
+      const baselineY = textMatrix[5];
+      const fontSize = Math.max(8, Math.hypot(textMatrix[2], textMatrix[3]) || getFontSize(item) * viewport.scale);
+      const width = Math.max((item.width || 0) * viewport.scale, text.length * fontSize * 0.42, 8);
       return {
         id: `p${pageNumber}-s${index}`,
         text,
         x,
-        y: y - fontSize,
-        width: Math.max(item.width || text.length * fontSize * 0.42, 8),
+        y: baselineY - fontSize,
+        baselineY,
+        width,
         height: fontSize * 1.35,
         fontSize,
         fontFamily: getFontFamily(item.fontName, textContent),
@@ -163,6 +181,7 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
           id: span.id,
           x: span.x,
           y: span.y,
+          baselineY: span.baselineY,
           width: span.width,
           height: span.height,
           fontSize: span.fontSize,
@@ -186,6 +205,7 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
     current.lineBoxes = current.lines.map((line) => ({
       x: line.x,
       y: line.y,
+      baselineY: median(line.segments.map((segment) => segment.baselineY)),
       width: line.width,
       height: line.height,
       fontSize: line.fontSize,
@@ -357,6 +377,7 @@ function getSourceLines(source) {
   return Array.from({ length: lineCount }, (_, index) => ({
     x: source.x,
     y: source.y + index * lineHeight,
+    baselineY: source.y + index * lineHeight + source.fontSize,
     width: source.width,
     height: lineHeight,
     fontSize: source.fontSize,
@@ -423,7 +444,7 @@ function drawOriginalTextSpans(ctx, pageData, skippedSpanIds) {
     .sort((a, b) => a.y - b.y || a.x - b.x)
     .forEach((span) => {
       setOriginalTextFont(ctx, span);
-      ctx.fillText(span.text, span.x, span.y + Math.max(8, span.fontSize || 12), getTextSpanWidth(ctx, span));
+      ctx.fillText(span.text, span.x, span.baselineY || span.y + Math.max(8, span.fontSize || 12), getTextSpanWidth(ctx, span));
     });
   ctx.restore();
 }
