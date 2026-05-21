@@ -319,12 +319,8 @@ p {
 }
 
 .annotation.bullet::before {
-  content: "•";
-  margin-right: 6px;
-}
-
-.annotation.bullet::before {
   content: "\2022";
+  margin-right: 6px;
 }
 
 .source-popover {
