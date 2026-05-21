@@ -567,12 +567,36 @@ function getTextSpanWidth(ctx, span) {
   return Math.max(span.width || 0, measuredWidth, estimatedWidth, 4);
 }
 
-function eraseTextSpans(ctx, pageData) {
+function shouldEraseRenderedSpan(ctx, x, y, width, height) {
+  const sampleWidth = Math.max(1, Math.floor(width));
+  const sampleHeight = Math.max(1, Math.floor(height));
+  if (sampleWidth <= 0 || sampleHeight <= 0) return false;
+
+  try {
+    const pixels = ctx.getImageData(x, y, sampleWidth, sampleHeight).data;
+    let nonWhitePixels = 0;
+    const totalPixels = pixels.length / 4;
+    for (let index = 0; index < pixels.length; index += 4) {
+      const red = pixels[index];
+      const green = pixels[index + 1];
+      const blue = pixels[index + 2];
+      if (red < 245 || green < 245 || blue < 245) nonWhitePixels += 1;
+    }
+
+    return nonWhitePixels / Math.max(1, totalPixels) < 0.35;
+  } catch (_) {
+    return true;
+  }
+}
+
+function eraseTextSpans(ctx, pageData, spanIds = null) {
   if (!pageData.textSpans?.length) return;
 
   ctx.save();
   ctx.fillStyle = "#ffffff";
   pageData.textSpans.forEach((span) => {
+    if (spanIds && !spanIds.has(span.id)) return;
+
     const fontSize = Math.max(8, span.fontSize || 12);
     const padX = Math.max(2, fontSize * 0.18);
     const padTop = Math.max(2, fontSize * 0.25);
@@ -581,6 +605,7 @@ function eraseTextSpans(ctx, pageData) {
     const y = Math.max(0, span.y - padTop);
     const right = Math.min(pageData.width, span.x + getTextSpanWidth(ctx, span) + padX);
     const bottom = Math.min(pageData.height, span.y + Math.max(span.height, fontSize * 1.35) + padBottom);
+    if (!shouldEraseRenderedSpan(ctx, x, y, right - x, bottom - y)) return;
     ctx.fillRect(x, y, right - x, bottom - y);
   });
   ctx.restore();
@@ -666,11 +691,17 @@ function layoutReplacementAnnotations(pageData, pageAnnotations) {
         textLength: 0,
       };
       const indent = annotation.kind === "bullet" ? Math.max(10, fontSize * 0.9) : 0;
+      const rightEdge = Math.min(pageData.width, source.x + source.width);
+      const maxAvailableWidth = Math.max(24, pageData.width - (line.x + indent) - 8);
+      const availableWidth = Math.min(
+        maxAvailableWidth,
+        Math.max(line.width - indent, rightEdge - (line.x + indent), source.width - indent, 220),
+      );
       positioned.push({
         ...annotation,
         x: line.x + indent,
         y: line.y,
-        width: Math.max(24, line.width - indent),
+        width: Math.max(24, availableWidth),
         height: Math.max(18, line.height),
         fontSize: annotation.kind === "header" ? Math.max(14, fontSize * 1.08) : Math.max(12, fontSize * 0.96),
         replacementText: getFixedLengthReplacement(annotation, line.text || source.text),
@@ -693,16 +724,20 @@ function layoutReplacementAnnotations(pageData, pageAnnotations) {
 
 function drawReplacementText(ctx, annotation) {
   const label = (annotation.replacementText || getCanvasLabel(annotation)).trimEnd();
-  const fontSize = annotation.fontSize || (annotation.kind === "header" ? 15 : 13);
+  let fontSize = annotation.fontSize || (annotation.kind === "header" ? 15 : 13);
   const weight = annotation.kind === "header" ? 800 : 650;
   const color = annotation.kind === "header" ? "#2563eb" : "#9f1239";
-  const baseline = annotation.y + Math.min(Math.max(fontSize + 2, annotation.height * 0.78), annotation.height - 2);
 
   ctx.save();
   ctx.fillStyle = color;
   ctx.font = `${weight} ${fontSize}px Inter, Arial, sans-serif`;
+  while (fontSize > 9 && ctx.measureText(label).width > annotation.width) {
+    fontSize -= 0.5;
+    ctx.font = `${weight} ${fontSize}px Inter, Arial, sans-serif`;
+  }
+  const baseline = annotation.y + Math.min(Math.max(fontSize + 2, annotation.height * 0.78), annotation.height - 2);
   ctx.textBaseline = "alphabetic";
-  ctx.fillText(label, annotation.x, baseline, annotation.width);
+  ctx.fillText(label, annotation.x, baseline);
   ctx.restore();
 }
 
@@ -733,8 +768,7 @@ async function renderPdfPages() {
     await page.render({ canvasContext, viewport }).promise;
     const pageAnnotations = state.annotations.filter((annotation) => annotation.pageNumber === i);
     const skippedSpanIds = getSkippedTextSpanIds(pageData, pageAnnotations);
-    eraseTextSpans(canvasContext, pageData);
-    drawOriginalTextSpans(canvasContext, pageData, skippedSpanIds);
+    eraseTextSpans(canvasContext, pageData, skippedSpanIds);
     const positionedAnnotations = layoutReplacementAnnotations(pageData, pageAnnotations);
     drawReplacementTexts(canvasContext, positionedAnnotations);
     pageEl.appendChild(canvas);
@@ -836,6 +870,27 @@ async function processCurrentPdf() {
     setStatus(error.message || "Transform failed.", 0);
   } finally {
     els.processButton.disabled = false;
+  }
+}
+
+async function autoloadLocalMockPdf() {
+  if (!USE_MOCK_AI || !["127.0.0.1", "localhost"].includes(window.location.hostname)) return;
+
+  const filename = new URLSearchParams(window.location.search).get("autoload");
+  if (!filename) return;
+
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const response = await fetch(filename);
+    if (!response.ok) throw new Error(`Could not load ${filename}`);
+    const blob = await response.blob();
+    const file = new File([blob], filename.split("/").pop() || "mock.pdf", { type: "application/pdf" });
+    await handleFile(file);
+    if (params.get("process") === "false") return;
+    await processCurrentPdf();
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Could not autoload mock PDF.", 0);
   }
 }
 
@@ -947,3 +1002,4 @@ document.addEventListener("click", () => document.querySelectorAll(".source-popo
 });
 
 els.dropZone.addEventListener("drop", (event) => handleFile(event.dataTransfer.files[0]));
+autoloadLocalMockPdf();
