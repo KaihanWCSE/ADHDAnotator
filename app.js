@@ -35,6 +35,8 @@ const els = {
   zoomOut: document.getElementById("zoomOut"),
   zoomLabel: document.getElementById("zoomLabel"),
   popoverTemplate: document.getElementById("popoverTemplate"),
+  demoNote: document.getElementById("demoNote"),
+  closeDemoNote: document.getElementById("closeDemoNote"),
 };
 
 const sampleText = `The American Civil War was a conflict between the northern states, known as the Union, and the southern states, known as the Confederacy, which had seceded from the United States. The war began in 1861 after years of political, economic, and moral tensions surrounding slavery, states' rights, and the expansion of slavery into western territories. Southern states depended heavily on enslaved labor for their agricultural economy, especially cotton production, while many in the North opposed the spread of slavery. The election of Abraham Lincoln in 1860 intensified these tensions because southern leaders feared his administration would limit slavery. Major battles such as Gettysburg, Antietam, and Vicksburg caused enormous casualties and destruction. During the war, Lincoln issued the Emancipation Proclamation, which declared enslaved people in Confederate states to be free and shifted the war's purpose toward ending slavery. The Union eventually defeated the Confederacy in 1865 due to its stronger industry, transportation systems, and larger population. The Civil War resulted in the abolition of slavery through the Thirteenth Amendment and permanently strengthened the federal government's authority over the states.`;
@@ -1001,6 +1003,9 @@ els.processButton.addEventListener("click", processCurrentPdf);
 els.sampleButton.addEventListener("click", renderSample);
 els.zoomIn.addEventListener("click", () => setZoom(state.scale + 0.1));
 els.zoomOut.addEventListener("click", () => setZoom(state.scale - 0.1));
+els.closeDemoNote.addEventListener("click", () => {
+  els.demoNote.hidden = true;
+});
 document.addEventListener("click", () => document.querySelectorAll(".source-popover").forEach((el) => el.remove()));
 
 ["dragenter", "dragover"].forEach((eventName) => {
