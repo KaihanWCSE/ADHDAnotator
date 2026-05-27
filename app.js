@@ -1,13 +1,15 @@
 const APP_ID = "app_jnnlkgx7ehdy";
 const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
-const BUILD_ID = "local-mock-ai-2026-05-21";
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
-const USE_MOCK_AI = true;
-const DEFAULT_MOCK_PDF = "test-fixtures/mockTest.pdf";
+const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
 
-window.PDF_ANNOTATOR_BUILD_ID = BUILD_ID;
-document.documentElement.dataset.build = BUILD_ID;
+const FALLBACK_MODELS = [
+  { id: "anthropic/claude-haiku-4.5", name: "Claude Haiku 4.5", prompt_price_per_mtok: 0.85, completion_price_per_mtok: 4.25 },
+  { id: "anthropic/claude-sonnet-4.6", name: "Claude Sonnet 4.6", prompt_price_per_mtok: 2.55, completion_price_per_mtok: 12.75 },
+  { id: "openai/gpt-4o-mini", name: "GPT-4o Mini", prompt_price_per_mtok: null, completion_price_per_mtok: null },
+  { id: "google/gemini-2.5-flash", name: "Gemini 2.5 Flash", prompt_price_per_mtok: null, completion_price_per_mtok: null },
+];
 
 const state = {
   file: null,
@@ -16,6 +18,8 @@ const state = {
   annotations: [],
   scale: 1,
   objectId: null,
+  models: [],
+  selectedModel: DEFAULT_MODEL,
 };
 
 const els = {
@@ -35,8 +39,8 @@ const els = {
   zoomOut: document.getElementById("zoomOut"),
   zoomLabel: document.getElementById("zoomLabel"),
   popoverTemplate: document.getElementById("popoverTemplate"),
-  demoNote: document.getElementById("demoNote"),
-  closeDemoNote: document.getElementById("closeDemoNote"),
+  modelSelect: document.getElementById("modelSelect"),
+  modelMeta: document.getElementById("modelMeta"),
 };
 
 const sampleText = `The American Civil War was a conflict between the northern states, known as the Union, and the southern states, known as the Confederacy, which had seceded from the United States. The war began in 1861 after years of political, economic, and moral tensions surrounding slavery, states' rights, and the expansion of slavery into western territories. Southern states depended heavily on enslaved labor for their agricultural economy, especially cotton production, while many in the North opposed the spread of slavery. The election of Abraham Lincoln in 1860 intensified these tensions because southern leaders feared his administration would limit slavery. Major battles such as Gettysburg, Antietam, and Vicksburg caused enormous casualties and destruction. During the war, Lincoln issued the Emancipation Proclamation, which declared enslaved people in Confederate states to be free and shifted the war's purpose toward ending slavery. The Union eventually defeated the Confederacy in 1865 due to its stronger industry, transportation systems, and larger population. The Civil War resulted in the abolition of slavery through the Thirteenth Amendment and permanently strengthened the federal government's authority over the states.`;
@@ -348,86 +352,79 @@ async function uploadPdf(file) {
   state.objectId = uploadData.objectId;
 }
 
-function getSummarizationPages() {
-  return state.pages.map(({ pageNumber, width, height, items }) => ({
-    pageNumber,
-    width,
-    height,
-    items: items.map(({ lineBoxes, spanIds, textLength, ...item }) => ({
-      ...item,
-      textLength,
-    })),
+function isReadableSourceBlock(item) {
+  const text = normalizeText(item.text);
+  if (text.length < 35) return false;
+  if (/^\d+$/.test(text)) return false;
+  if (/^page\s+\d+$/i.test(text)) return false;
+  return ["paragraph", "text", "bullet"].includes(item.kind) || countSentences(text) > 0;
+}
+
+function getSourceItems() {
+  return state.pages
+    .flatMap((page) => page.items)
+    .filter(isReadableSourceBlock);
+}
+
+function getSourceItemById() {
+  return new Map(state.pages.flatMap((page) => page.items).map((item) => [item.id, item]));
+}
+
+function buildArticlePayload() {
+  const sourceBlocks = getSourceItems().map((item, index) => ({
+    id: item.id,
+    order: index,
+    pageNumber: item.pageNumber,
+    kind: item.kind,
+    text: item.text,
   }));
-}
 
-function makeMockChunk(label, sentences) {
   return {
-    label,
-    sourceText: normalizeText(sentences.filter(Boolean).join(" ")),
+    title: state.file?.name?.replace(/\.pdf$/i, "") || "Uploaded PDF",
+    articles: [{
+      articleId: "pdf-article-1",
+      title: state.file?.name?.replace(/\.pdf$/i, "") || "Uploaded PDF",
+      sourceBlocks,
+    }],
   };
 }
 
-function chunkBySentenceRanges(sentences, ranges) {
-  return ranges
-    .map(([label, start, end]) => makeMockChunk(label, sentences.slice(start, end)))
-    .filter((chunk) => chunk.sourceText);
+function coerceIdList(value) {
+  if (!Array.isArray(value)) return [];
+  return value.map((id) => String(id)).filter(Boolean);
 }
 
-function findSentenceIndex(sentences, pattern) {
-  const normalizedPattern = normalizeForMatch(pattern);
-  return sentences.findIndex((sentence) => normalizeForMatch(sentence).includes(normalizedPattern));
+function findSourceIdsForText(sourceText, allowedIds = []) {
+  const sourceById = getSourceItemById();
+  const candidates = allowedIds.length ? allowedIds.map((id) => sourceById.get(id)).filter(Boolean) : getSourceItems();
+  const normalizedNeedle = normalizeForMatch(sourceText);
+  if (!normalizedNeedle) return [];
+
+  const direct = candidates.find((item) => normalizeForMatch(item.text).includes(normalizedNeedle));
+  if (direct) return [direct.id];
+
+  const sourceWords = new Set(normalizedNeedle.split(/\s+/).filter((word) => word.length > 3));
+  let best = null;
+  let bestScore = 0;
+  candidates.forEach((item) => {
+    const words = normalizeForMatch(item.text).split(/\s+/);
+    const overlap = words.filter((word) => sourceWords.has(word)).length;
+    const score = overlap / Math.max(1, sourceWords.size);
+    if (score > bestScore) {
+      best = item;
+      bestScore = score;
+    }
+  });
+
+  return best && bestScore >= 0.35 ? [best.id] : [];
 }
 
-function mockPlanForParagraph(text) {
-  const sentences = splitIntoSentences(text);
-  const normalized = normalizeForMatch(text);
-  if (sentences.length < 2) return null;
-
-  if (normalized.includes("bad final grade") && normalized.includes("mindful journaling") && normalized.includes("describe")) {
-    return {
-      header: "Mindfulness for Emotional Processing",
-      chunks: chunkBySentenceRanges(sentences, [
-        ["Emotional Impact of Bad Grades", 0, 2],
-        ["Mindful Journaling Practice", 2, 4],
-        ["Describing Emotions Objectively", 4, sentences.length],
-      ]),
-    };
-  }
-
-  if (normalized.includes("recognize and validate my emotions") && normalized.includes("self discovery")) {
-    const growthStart = findSentenceIndex(sentences, "So, Mindful Journaling");
-    const splitAt = growthStart > 0 ? growthStart : Math.ceil(sentences.length / 2);
-    return {
-      header: "Benefits of Mindful Journaling",
-      chunks: chunkBySentenceRanges(sentences, [
-        ["Recognizing Emotional Patterns", 0, splitAt],
-        ["Turning Challenge into Growth", splitAt, sentences.length],
-      ]),
-    };
-  }
-
-  if (normalized.includes("nonjudgmentally") && normalized.includes("one mindfully") && normalized.includes("journaling")) {
-    const oneMindfully = findSentenceIndex(sentences, "One-Mindfully");
-    const effectively = Math.max(
-      findSentenceIndex(sentences, "Effectively"),
-      findSentenceIndex(sentences, "effectively, I would tailor"),
-    );
-    const secondStart = oneMindfully > 0 ? oneMindfully : Math.ceil(sentences.length / 3);
-    const thirdStart = effectively > secondStart ? effectively : Math.ceil((sentences.length * 2) / 3);
-    return {
-      header: "HOW Skills for Mindful Journaling",
-      chunks: chunkBySentenceRanges(sentences, [
-        ["Nonjudgmental Acceptance", 0, secondStart],
-        ["One-Mindful Focus", secondStart, thirdStart],
-        ["Effective Action Steps", thirdStart, sentences.length],
-      ]),
-    };
-  }
-
-  return {
-    header: null,
-    chunks: [makeMockChunk("Mock Summary", sentences)],
-  };
+function getFirstSourceItem(ids, fallbackText = "") {
+  const sourceById = getSourceItemById();
+  const validIds = coerceIdList(ids).filter((id) => sourceById.has(id));
+  if (validIds.length) return sourceById.get(validIds[0]);
+  const matchedIds = findSourceIdsForText(fallbackText);
+  return matchedIds.length ? sourceById.get(matchedIds[0]) : null;
 }
 
 function annotationFromPlan(item, kind, label, originalText, index) {
@@ -437,8 +434,8 @@ function annotationFromPlan(item, kind, label, originalText, index) {
     pageNumber: item.pageNumber,
     sourceItemIds: [item.id],
     kind,
-    label,
-    originalText,
+    label: normalizeText(label).slice(0, 90),
+    originalText: kind === "bullet" ? normalizeText(originalText || item.text) : "",
     x,
     y: item.y + index * lineHeight,
     width: Math.max(24, item.width - (kind === "bullet" ? Math.max(12, item.fontSize) : 0)),
@@ -446,57 +443,44 @@ function annotationFromPlan(item, kind, label, originalText, index) {
   };
 }
 
-function mockSummarizeDocument() {
+function annotationsFromStructuredSummary(data) {
   const annotations = [];
-  let summarizedParagraphs = 0;
+  const rowBySource = new Map();
+  const nextRow = (itemId) => {
+    const row = rowBySource.get(itemId) || 0;
+    rowBySource.set(itemId, row + 1);
+    return row;
+  };
 
-  state.pages.forEach((page) => {
-    page.items.forEach((item) => {
-      if (item.kind !== "paragraph" || countSentences(item.text) <= 2 || normalizeText(item.text).length <= 180) return;
-
-      const plan = mockPlanForParagraph(item.text);
-      if (!plan?.chunks?.length) return;
-
-      let rowIndex = 0;
-      if (plan.header) {
-        annotations.push(annotationFromPlan(item, "header", plan.header, "", rowIndex));
-        rowIndex += 1;
+  (data.articles || []).forEach((article) => {
+    (article.sections || []).forEach((section) => {
+      const sectionBlocks = section.blocks || [];
+      const firstBlock = sectionBlocks.find((block) => coerceIdList(block.sourceBlockIds).length || block.sourceText);
+      const headerItem = getFirstSourceItem(section.sourceBlockIds, section.sourceText) || getFirstSourceItem(firstBlock?.sourceBlockIds, firstBlock?.sourceText);
+      if (headerItem && section.title) {
+        annotations.push(annotationFromPlan(headerItem, "header", section.title, "", nextRow(headerItem.id)));
       }
 
-      plan.chunks.forEach((chunk) => {
-        annotations.push(annotationFromPlan(item, "bullet", chunk.label, chunk.sourceText, rowIndex));
-        rowIndex += 1;
+      sectionBlocks.forEach((block) => {
+        const sourceIds = coerceIdList(block.sourceBlockIds);
+        const matchedIds = sourceIds.length ? sourceIds : findSourceIdsForText(block.sourceText, coerceIdList(section.sourceBlockIds));
+        const item = getFirstSourceItem(matchedIds, block.sourceText);
+        if (!item || !block.bullet) return;
+        annotations.push(annotationFromPlan(item, "bullet", block.bullet, block.sourceText || item.text, nextRow(item.id)));
       });
-
-      summarizedParagraphs += 1;
     });
   });
 
-  return {
-    document: {
-      title: state.file?.name?.replace(/\.pdf$/i, "") || "Mock Annotated PDF",
-      fileObjectId: null,
-    },
-    annotations,
-    stats: {
-      pages: state.pages.length,
-      summarizedParagraphs,
-      annotations: annotations.length,
-    },
-  };
+  return annotations;
 }
 
 async function summarizeDocument() {
-  if (USE_MOCK_AI) {
-    setStatus("Using local mock AI response...", 62);
-    const data = mockSummarizeDocument();
-    state.annotations = data.annotations || [];
-    els.docTitle.textContent = data.document?.title || state.file.name;
-    els.docSubtitle.textContent = `${data.stats?.summarizedParagraphs || 0} long paragraphs transformed with mock AI.`;
-    return;
+  const articlePayload = buildArticlePayload();
+  if (!articlePayload.articles[0].sourceBlocks.length) {
+    throw new Error("This PDF does not contain enough selectable text to summarize.");
   }
 
-  setStatus("Asking AI to create presentation annotations...", 62);
+  setStatus(`Asking ${state.selectedModel} to structure the article...`, 62);
   const response = await fetch(`${API_BASE}/fn/summarize-document`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -504,14 +488,18 @@ async function summarizeDocument() {
       filename: state.file.name,
       title: state.file.name.replace(/\.pdf$/i, ""),
       fileObjectId: state.objectId,
-      pages: getSummarizationPages(),
+      model: state.selectedModel,
+      articles: articlePayload.articles,
     }),
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "Summarization failed");
-  state.annotations = data.annotations || [];
+  state.annotations = annotationsFromStructuredSummary(data);
+  if (!state.annotations.length) {
+    throw new Error("The model returned no usable source-linked annotations.");
+  }
   els.docTitle.textContent = data.document?.title || state.file.name;
-  els.docSubtitle.textContent = `${data.stats?.summarizedParagraphs || 0} long paragraphs transformed into clickable notes.`;
+  els.docSubtitle.textContent = `${data.stats?.sections || 0} sections and ${data.stats?.blocks || state.annotations.length} content blocks transformed into clickable notes.`;
 }
 
 function getAnnotationsBySource(pageAnnotations) {
@@ -529,7 +517,7 @@ function getSourceReplacements(pageData, pageAnnotations) {
   const annotationsBySource = getAnnotationsBySource(pageAnnotations);
 
   return pageData.items
-    .filter((item) => item.kind === "paragraph" && annotationsBySource.has(item.id))
+    .filter((item) => annotationsBySource.has(item.id))
     .map((source) => ({
       source,
       annotations: annotationsBySource.get(source.id) || [],
@@ -830,8 +818,7 @@ function showPopover(anchor, text) {
 function refreshCounters() {
   els.fileName.textContent = state.file?.name || "None";
   els.pageCount.textContent = String(state.pages.length);
-  const paragraphs = state.pages.flatMap((page) => page.items).filter((item) => item.kind === "paragraph" && countSentences(item.text) > 2);
-  els.paragraphCount.textContent = String(paragraphs.length);
+  els.paragraphCount.textContent = String(getSourceItems().length);
 }
 
 async function handleFile(file) {
@@ -872,11 +859,7 @@ async function processCurrentPdf() {
   if (!state.file || !state.pages.length) return;
   els.processButton.disabled = true;
   try {
-    if (USE_MOCK_AI) {
-      state.objectId = null;
-    } else {
-      await uploadPdf(state.file);
-    }
+    state.objectId = null;
     await summarizeDocument();
     await renderPdfPages();
   } catch (error) {
@@ -884,31 +867,6 @@ async function processCurrentPdf() {
     setStatus(error.message || "Transform failed.", 0);
   } finally {
     els.processButton.disabled = false;
-  }
-}
-
-async function autoloadLocalMockPdf() {
-  if (!USE_MOCK_AI) return;
-
-  const params = new URLSearchParams(window.location.search);
-  const isLocalHost = ["127.0.0.1", "localhost"].includes(window.location.hostname);
-  const isButterbaseHost = window.location.hostname === "pdf-annotator-ai.butterbase.dev";
-  if (!isLocalHost && !isButterbaseHost) return;
-
-  const filename = params.get("autoload") || (isButterbaseHost ? DEFAULT_MOCK_PDF : "");
-  if (!filename) return;
-
-  try {
-    const response = await fetch(filename);
-    if (!response.ok) throw new Error(`Could not load ${filename}`);
-    const blob = await response.blob();
-    const file = new File([blob], filename.split("/").pop() || "mock.pdf", { type: "application/pdf" });
-    await handleFile(file);
-    if (params.get("process") === "false") return;
-    await processCurrentPdf();
-  } catch (error) {
-    console.error(error);
-    setStatus(error.message || "Could not autoload mock PDF.", 0);
   }
 }
 
@@ -998,13 +956,54 @@ function setZoom(nextScale) {
   });
 }
 
+function formatModelPrice(model) {
+  const input = model.prompt_price_per_mtok;
+  const output = model.completion_price_per_mtok;
+  if (Number.isFinite(input) && Number.isFinite(output)) {
+    return `$${input}/M in, $${output}/M out`;
+  }
+  return "Pricing available in Butterbase";
+}
+
+function populateModelSelect(models) {
+  state.models = models.length ? models : FALLBACK_MODELS;
+  els.modelSelect.innerHTML = "";
+  state.models.forEach((model) => {
+    const option = document.createElement("option");
+    option.value = model.id;
+    option.textContent = model.name ? `${model.name} (${model.id})` : model.id;
+    els.modelSelect.appendChild(option);
+  });
+
+  const defaultExists = state.models.some((model) => model.id === DEFAULT_MODEL);
+  state.selectedModel = defaultExists ? DEFAULT_MODEL : state.models[0].id;
+  els.modelSelect.value = state.selectedModel;
+  const selected = state.models.find((model) => model.id === state.selectedModel);
+  els.modelMeta.textContent = selected ? formatModelPrice(selected) : "Butterbase AI gateway";
+}
+
+async function loadModelOptions() {
+  try {
+    const response = await fetch(`${API_BASE}/fn/list-ai-models`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Could not load AI models");
+    populateModelSelect(data.models || []);
+  } catch (error) {
+    console.warn(error);
+    populateModelSelect(FALLBACK_MODELS);
+    els.modelMeta.textContent = "Using fallback model list";
+  }
+}
+
 els.input.addEventListener("change", (event) => handleFile(event.target.files[0]));
 els.processButton.addEventListener("click", processCurrentPdf);
 els.sampleButton.addEventListener("click", renderSample);
 els.zoomIn.addEventListener("click", () => setZoom(state.scale + 0.1));
 els.zoomOut.addEventListener("click", () => setZoom(state.scale - 0.1));
-els.closeDemoNote.addEventListener("click", () => {
-  els.demoNote.hidden = true;
+els.modelSelect.addEventListener("change", () => {
+  state.selectedModel = els.modelSelect.value || DEFAULT_MODEL;
+  const selected = state.models.find((model) => model.id === state.selectedModel);
+  els.modelMeta.textContent = selected ? formatModelPrice(selected) : "Butterbase AI gateway";
 });
 document.addEventListener("click", () => document.querySelectorAll(".source-popover").forEach((el) => el.remove()));
 
@@ -1023,4 +1022,4 @@ document.addEventListener("click", () => document.querySelectorAll(".source-popo
 });
 
 els.dropZone.addEventListener("drop", (event) => handleFile(event.dataTransfer.files[0]));
-autoloadLocalMockPdf();
+loadModelOptions();

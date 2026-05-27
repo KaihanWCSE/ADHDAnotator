@@ -1,16 +1,19 @@
 # ADHDAnotator
 
-## Local mock testing
+ADHD Anotator is a Butterbase-hosted PDF reading tool that turns uploaded PDF text into ADHD-friendly section titles and clickable bullet summaries.
 
-Run a local static server from the repo root, then open:
+## Current Architecture
 
-```text
-http://127.0.0.1:4177/?autoload=test-fixtures/mockTest.pdf
-```
+- Static frontend: `index.html`, `styles.css`, and `app.js`
+- PDF parsing: PDF.js runs in the browser and extracts text blocks from user-uploaded PDFs
+- AI backend: Butterbase functions in `butterbase-functions/`
+  - `list-ai-models` returns a compact list of recommended chat models
+  - `summarize-document` sends extracted article blocks to the selected Butterbase AI model
+- Rendering: the frontend places section titles and bullet summaries back onto the PDF preview; each bullet opens its exact source text
 
-`test-fixtures/mockTest.pdf` is a regression fixture for the local mock AI flow, PDF text cleanup, annotation placement, and source popovers.
+## Deployment
 
-The Butterbase demo URL currently auto-loads the same mock PDF fixture so the submitted project can be reviewed without AI credits:
+The frontend is deployed as a static Butterbase site:
 
 ```text
 https://pdf-annotator-ai.butterbase.dev

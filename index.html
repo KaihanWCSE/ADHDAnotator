@@ -27,6 +27,14 @@
         <button class="primary-action" id="processButton" disabled>Transform PDF</button>
         <button class="secondary-action" id="sampleButton">Try Sample Text</button>
 
+        <label class="model-picker" for="modelSelect">
+          <span>AI model</span>
+          <select id="modelSelect">
+            <option value="">Loading models...</option>
+          </select>
+          <small id="modelMeta">Butterbase AI gateway</small>
+        </label>
+
         <div class="status-card">
           <div class="status-row">
             <span>Document</span>
@@ -37,7 +45,7 @@
             <strong id="pageCount">0</strong>
           </div>
           <div class="status-row">
-            <span>Long paragraphs</span>
+            <span>Text blocks</span>
             <strong id="paragraphCount">0</strong>
           </div>
           <div class="progress">
@@ -73,14 +81,6 @@
         </div>
       </section>
     </main>
-
-    <aside class="demo-note" id="demoNote" aria-labelledby="demoNoteTitle">
-      <button class="close-demo-note" id="closeDemoNote" type="button" aria-label="Close about this demo">x</button>
-      <h3 id="demoNoteTitle">About this demo</h3>
-      <p>ADHD Anotator turns dense PDF paragraphs into short, clickable bullet points so the main ideas are easier to scan. Each bullet links back to the exact original text it came from, so the summary stays connected to the source instead of replacing context.</p>
-      <p>This version is running in mock mode for the hackathon demo. The PDF, bullet structure, and source-text popovers are working, but the AI summarization step is temporarily using a fixed mock response because Butterbase AI encountered account error during development and could not give me any AI credits.</p>
-      <p>The current demo auto-loads a test PDF so reviewers can see the intended reading experience end to end. The next step is to connect the same workflow to a live LLM API so uploaded PDFs can be summarized dynamically.</p>
-    </aside>
 
     <template id="popoverTemplate">
       <div class="source-popover">

@@ -1,234 +1,326 @@
-const MODEL = "anthropic/claude-sonnet-4.5";
-
-const JSON_HEADERS = {
-  "Content-Type": "application/json",
+const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
-function jsonResponse(body, status = 200) {
-  return new Response(JSON.stringify(body), {
+const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
+const MAX_SOURCE_CHARS = 85000;
+const MAX_SOURCE_BLOCKS = 160;
+
+const SYSTEM_PROMPT = `You are an expert reading-comprehension restructuring engine for ADHD-friendly reading.
+
+Your task is to transform full articles into a structured reading map.
+
+You must do exactly four things:
+1. Divide each article into meaningful sections.
+2. Generate a clear title for each section.
+3. Divide each section into smaller content blocks based on meaning.
+4. Summarize each block into a short bullet label.
+
+Important rules:
+- Split by meaning and structure, not mechanically by sentence count.
+- A section may contain one or multiple source blocks.
+- A content block may contain one sentence or multiple sentences.
+- All sections together must cover the entire article.
+- All blocks together must cover the entire section.
+- Preserve the original article order.
+- Do not omit major ideas.
+- Do not invent information.
+- Each section must include sourceBlockIds and exact sourceText copied from the input.
+- Each block must include sourceBlockIds and exact sourceText copied from the input.
+- Prefer one sourceBlockId per block when one source block contains the whole idea.
+- If one idea continues across adjacent source blocks, include multiple adjacent sourceBlockIds.
+- Bullet labels should be 3 to 10 words and useful as clickable links.
+- Section titles should be 3 to 8 words and describe the section's main purpose.
+- If uncertain whether content deserves its own block, create a block instead of dropping it.
+
+Return only valid JSON. Do not include markdown, commentary, explanations, or code fences.`;
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
     status,
-    headers: JSON_HEADERS,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/json",
+    },
   });
+}
+
+function gatewayBase(ctx) {
+  const raw = ctx?.env?.BUTTERBASE_API_URL || "https://api.butterbase.ai";
+  return raw.replace(/\/v1\/[^/]+\/?$/, "").replace(/\/$/, "");
 }
 
 function normalizeText(text) {
   return String(text || "").replace(/\s+/g, " ").trim();
 }
 
-function countSentences(text) {
-  return (String(text || "").match(/[.!?]+(?=\s|$)/g) || []).length;
+function normalizeForMatch(text) {
+  return normalizeText(text).toLowerCase().replace(/[^\w\s]/g, " ");
 }
 
-function parseJsonFromText(text) {
-  const cleaned = String(text || "").trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```$/i, "").trim();
+function shortLabel(text, maxWords = 10, maxChars = 72) {
+  const normalized = normalizeText(text);
+  const words = normalized.split(/\s+/).filter(Boolean);
+  const shortened = words.length > maxWords ? words.slice(0, maxWords).join(" ") : normalized;
+  return shortened.length > maxChars ? `${shortened.slice(0, maxChars - 1).trim()}...` : shortened;
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function coerceIdList(value, knownIds) {
+  return asArray(value)
+    .map((id) => String(id))
+    .filter((id) => knownIds.has(id));
+}
+
+function extractJson(text) {
+  const raw = String(text || "").trim();
   try {
-    return JSON.parse(cleaned);
+    return JSON.parse(raw);
   } catch (_) {
-    const start = cleaned.indexOf("{");
-    const end = cleaned.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-      return JSON.parse(cleaned.slice(start, end + 1));
+    const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) return JSON.parse(fenced[1]);
+    const first = raw.indexOf("{");
+    const last = raw.lastIndexOf("}");
+    if (first >= 0 && last > first) return JSON.parse(raw.slice(first, last + 1));
+    throw new Error("Model did not return parseable JSON");
+  }
+}
+
+function findBlockIdsByText(sourceText, sourceBlocks, allowedIds = []) {
+  const needle = normalizeForMatch(sourceText);
+  if (!needle) return [];
+  const allowed = allowedIds.length ? new Set(allowedIds) : null;
+  const candidates = sourceBlocks.filter((block) => !allowed || allowed.has(block.id));
+
+  const direct = candidates.find((block) => normalizeForMatch(block.text).includes(needle));
+  if (direct) return [direct.id];
+
+  const needleWords = new Set(needle.split(/\s+/).filter((word) => word.length > 3));
+  let best = null;
+  let bestScore = 0;
+  candidates.forEach((block) => {
+    const words = normalizeForMatch(block.text).split(/\s+/);
+    const overlap = words.filter((word) => needleWords.has(word)).length;
+    const score = overlap / Math.max(1, needleWords.size);
+    if (score > bestScore) {
+      best = block;
+      bestScore = score;
     }
-    throw new Error("AI response was not JSON");
+  });
+
+  return best && bestScore >= 0.35 ? [best.id] : [];
+}
+
+function sourceTextFromIds(ids, byId) {
+  return ids.map((id) => byId.get(id)?.text).filter(Boolean).join(" ");
+}
+
+function normalizeArticles(rawArticles) {
+  return asArray(rawArticles).map((article, articleIndex) => {
+    const sourceBlocks = asArray(article.sourceBlocks)
+      .slice(0, MAX_SOURCE_BLOCKS)
+      .map((block, blockIndex) => ({
+        id: String(block.id || `article-${articleIndex}-block-${blockIndex}`),
+        order: Number.isFinite(block.order) ? block.order : blockIndex,
+        pageNumber: Number.isFinite(block.pageNumber) ? block.pageNumber : null,
+        kind: String(block.kind || "text"),
+        text: normalizeText(block.text),
+      }))
+      .filter((block) => block.text.length >= 20);
+
+    return {
+      articleId: String(article.articleId || `article-${articleIndex + 1}`),
+      title: normalizeText(article.title) || `Article ${articleIndex + 1}`,
+      sourceBlocks,
+    };
+  }).filter((article) => article.sourceBlocks.length);
+}
+
+function buildUserPrompt(title, articles) {
+  return `Restructure the following article(s) into ADHD-friendly reading annotations.
+
+Return this exact JSON shape:
+{
+  "document": {
+    "title": "string"
+  },
+  "articles": [
+    {
+      "articleId": "string",
+      "title": "string",
+      "sections": [
+        {
+          "sectionId": "string",
+          "title": "string",
+          "sourceBlockIds": ["string"],
+          "sourceText": "exact original text covered by this section",
+          "blocks": [
+            {
+              "blockId": "string",
+              "bullet": "short clickable bullet summary",
+              "sourceBlockIds": ["string"],
+              "sourceText": "exact original text covered by this block"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "stats": {
+    "sections": number,
+    "blocks": number
   }
 }
 
-function orderedCoverageIsValid(originalText, chunks) {
-  const source = normalizeText(originalText).toLowerCase();
-  const joined = normalizeText(chunks.map((chunk) => chunk.sourceText).join(" ")).toLowerCase();
-  if (joined === source) return true;
+Output rules:
+- Each article must have at least one section.
+- Each section must have at least one block.
+- Use only sourceBlockIds that appear in the input.
+- Section sourceText must be copied from the input source blocks.
+- Block sourceText must be copied from the input source blocks.
+- Blocks inside a section should cover the full section sourceText.
+- Do not create bullets for page numbers, footers, or tiny fragments.
+- Keep bullet labels between 3 and 10 words when possible.
+- Keep section titles between 3 and 8 words when possible.
+- Do not include coordinates. The frontend places annotations from sourceBlockIds.
+- Return valid JSON only.
 
-  let cursor = 0;
-  for (const chunk of chunks) {
-    const needle = normalizeText(chunk.sourceText).toLowerCase();
-    if (!needle) return false;
-    const next = source.indexOf(needle, cursor);
-    if (next < 0) return false;
-    cursor = next + needle.length;
-  }
+Document title: ${title}
 
-  const covered = normalizeText(chunks.map((chunk) => chunk.sourceText).join(" ")).length;
-  return covered >= normalizeText(originalText).length * 0.97;
+Input articles:
+${JSON.stringify({ articles })}`;
 }
 
-function safeFallbackChunk(item) {
-  const firstSentence = normalizeText(item.text).split(/(?<=[.!?])\s+/)[0] || item.text;
+function normalizeModelResult(parsed, title, inputArticles) {
+  const inputByArticle = new Map(inputArticles.map((article) => [article.articleId, article]));
+  let totalSections = 0;
+  let totalBlocks = 0;
+
+  const articles = asArray(parsed.articles).map((article, articleIndex) => {
+    const inputArticle = inputByArticle.get(String(article.articleId)) || inputArticles[articleIndex] || inputArticles[0];
+    const byId = new Map(inputArticle.sourceBlocks.map((block) => [block.id, block]));
+    const knownIds = new Set(byId.keys());
+
+    const sections = asArray(article.sections).map((section, sectionIndex) => {
+      let sectionIds = coerceIdList(section.sourceBlockIds, knownIds);
+      if (!sectionIds.length) sectionIds = findBlockIdsByText(section.sourceText, inputArticle.sourceBlocks);
+
+      const blocks = asArray(section.blocks).map((block, blockIndex) => {
+        let blockIds = coerceIdList(block.sourceBlockIds, knownIds);
+        if (!blockIds.length) blockIds = findBlockIdsByText(block.sourceText, inputArticle.sourceBlocks, sectionIds);
+        if (!blockIds.length) return null;
+
+        const sourceText = normalizeText(block.sourceText) || sourceTextFromIds(blockIds, byId);
+        const bullet = shortLabel(block.bullet || block.label || `Point ${blockIndex + 1}`);
+        if (!sourceText || !bullet) return null;
+
+        return {
+          blockId: String(block.blockId || `${inputArticle.articleId}-s${sectionIndex + 1}-b${blockIndex + 1}`),
+          bullet,
+          sourceBlockIds: blockIds,
+          sourceText,
+        };
+      }).filter(Boolean);
+
+      if (!sectionIds.length) {
+        sectionIds = [...new Set(blocks.flatMap((block) => block.sourceBlockIds))];
+      }
+      if (!sectionIds.length || !blocks.length) return null;
+
+      totalSections += 1;
+      totalBlocks += blocks.length;
+      return {
+        sectionId: String(section.sectionId || `${inputArticle.articleId}-s${sectionIndex + 1}`),
+        title: shortLabel(section.title || `Section ${sectionIndex + 1}`, 8, 70),
+        sourceBlockIds: sectionIds,
+        sourceText: normalizeText(section.sourceText) || sourceTextFromIds(sectionIds, byId),
+        blocks,
+      };
+    }).filter(Boolean);
+
+    return {
+      articleId: inputArticle.articleId,
+      title: normalizeText(article.title) || inputArticle.title,
+      sections,
+    };
+  }).filter((article) => article.sections.length);
+
   return {
-    header: null,
-    chunks: [{
-      label: firstSentence.length > 72 ? `${firstSentence.slice(0, 69).trim()}...` : firstSentence,
-      sourceText: item.text,
-    }],
+    document: {
+      title: normalizeText(parsed?.document?.title) || title,
+    },
+    articles,
+    stats: {
+      sections: totalSections,
+      blocks: totalBlocks,
+    },
   };
 }
 
-function cleanAiPlan(plan, item) {
-  const chunks = Array.isArray(plan?.chunks) ? plan.chunks : [];
-  const cleanedChunks = chunks
-    .map((chunk) => ({
-      label: normalizeText(chunk?.label).replace(/^[-*\u2022]\s*/, ""),
-      sourceText: normalizeText(chunk?.sourceText),
-    }))
-    .filter((chunk) => chunk.label && chunk.sourceText);
+export default async function handler(req, ctx) {
+  if (req.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
+  if (req.method !== "POST") return json({ error: "Method not allowed" }, 405);
 
-  const header = normalizeText(plan?.header);
-  const cleaned = {
-    header: header || null,
-    chunks: cleanedChunks,
-  };
-
-  if (!cleaned.chunks.length || !orderedCoverageIsValid(item.text, cleaned.chunks)) {
-    return null;
+  let body;
+  try {
+    body = await req.json();
+  } catch (_) {
+    return json({ error: "Request body must be valid JSON" }, 400);
   }
 
-  return cleaned;
-}
+  const title = normalizeText(body.title || body.filename || "Uploaded PDF");
+  const articles = normalizeArticles(body.articles);
+  if (!articles.length) return json({ error: "No readable article text was provided" }, 400);
 
-async function callAi(ctx, item, attempt) {
-  const apiUrl = ctx.env.BUTTERBASE_API_URL;
-  const appId = ctx.env.BUTTERBASE_APP_ID;
-  const apiKey = ctx.env.BUTTERBASE_API_KEY;
-  if (!apiUrl || !appId || !apiKey) {
-    throw new Error("Butterbase AI environment is not configured");
+  const sourceChars = articles.reduce((sum, article) => (
+    sum + article.sourceBlocks.reduce((inner, block) => inner + block.text.length, 0)
+  ), 0);
+  if (sourceChars > MAX_SOURCE_CHARS) {
+    return json({ error: "This PDF has too much extracted text for one AI request. Try a shorter PDF for now." }, 413);
   }
 
-  const systemPrompt = [
-    "You transform dense educational paragraphs into clickable presentation notes.",
-    "You must split the paragraph into semantic chunks, not sentence-by-sentence chunks.",
-    "A semantic chunk may contain one sentence or multiple adjacent sentences when they support the same big point.",
-    "Prefer 3 to 4 chunks for a normal paragraph. Do not create one chunk per sentence unless every sentence is truly a separate idea.",
-    "Group examples, causes, explanations, outcomes, evidence, and same-phase events with the sentence that introduces the same idea.",
-    "Every word of the original paragraph must belong to exactly one chunk.",
-    "Chunks must appear in the same order as the original paragraph.",
-    "Each chunk gets a concise bullet label.",
-    "Use exact original text for sourceText. Do not paraphrase, correct, omit, or reorder sourceText.",
-    "Return JSON only.",
-  ].join(" ");
+  const apiKey = ctx?.env?.BUTTERBASE_API_KEY;
+  if (!apiKey) return json({ error: "Butterbase AI API key is not configured for this function" }, 500);
 
-  const userPrompt = [
-    "Split this paragraph by meaning, then summarize each chunk into a bullet label.",
-    "Return this exact JSON shape:",
-    "{\"header\": string|null, \"chunks\": [{\"label\": string, \"sourceText\": string}]}",
-    "Rules:",
-    "- header may be null if the paragraph is short/simple.",
-    "- sourceText values must concatenate back to the full paragraph, allowing whitespace differences only.",
-    "- Use fewer, larger idea chunks instead of sentence-by-sentence bullets; 3 to 4 chunks is usually right.",
-    "- Do not leave out transition sentences, examples, or explanations.",
-    "- If unsure whether two sentences belong together, keep them together.",
-    attempt > 1 ? "- Previous response failed coverage validation. Be more literal with sourceText." : "",
-    "",
-    `Paragraph:\n${item.text}`,
-  ].join("\n");
-
-  const response = await fetch(`${apiUrl}/v1/${appId}/chat/completions`, {
+  const appId = ctx?.env?.BUTTERBASE_APP_ID || "app_jnnlkgx7ehdy";
+  const model = normalizeText(body.model) || DEFAULT_MODEL;
+  const response = await fetch(`${gatewayBase(ctx)}/v1/${appId}/chat/completions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: MODEL,
+      model,
+      temperature: 0.15,
+      max_tokens: 8000,
       messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: buildUserPrompt(title, articles) },
       ],
-      temperature: 0.1,
-      max_tokens: 1800,
     }),
   });
 
-  const data = await response.json();
+  const aiData = await response.json();
   if (!response.ok) {
-    throw new Error(data?.error?.message || "Butterbase AI request failed");
-  }
-
-  const content = data?.choices?.[0]?.message?.content;
-  return parseJsonFromText(content);
-}
-
-async function makeSemanticPlan(ctx, item) {
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      const plan = await callAi(ctx, item, attempt);
-      const cleaned = cleanAiPlan(plan, item);
-      if (cleaned) return cleaned;
-    } catch (error) {
-      console.warn(`semantic plan attempt ${attempt} failed for ${item.id}: ${error.message}`);
-    }
-  }
-  return safeFallbackChunk(item);
-}
-
-function annotationFromItem(item, kind, label, originalText, index) {
-  const lineHeight = Math.max(20, item.fontSize * 1.55);
-  const x = kind === "bullet" ? item.x + Math.max(12, item.fontSize) : item.x;
-  return {
-    pageNumber: item.pageNumber,
-    sourceItemIds: [item.id],
-    kind,
-    label,
-    originalText,
-    x,
-    y: item.y + index * lineHeight,
-    width: Math.max(24, item.width - (kind === "bullet" ? Math.max(12, item.fontSize) : 0)),
-    height: lineHeight,
-  };
-}
-
-export async function handler(req, ctx) {
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 204, headers: JSON_HEADERS });
-  }
-  if (req.method !== "POST") {
-    return jsonResponse({ error: "Method not allowed" }, 405);
+    return json({
+      error: aiData?.error?.message || aiData?.error || "Butterbase AI request failed",
+      model,
+    }, response.status);
   }
 
   try {
-    const body = await req.json();
-    const pages = Array.isArray(body.pages) ? body.pages : [];
-    const annotations = [];
-    let summarizedParagraphs = 0;
-
-    for (const page of pages) {
-      const items = Array.isArray(page.items) ? page.items : [];
-      for (const item of items) {
-        if (item.kind !== "paragraph" || countSentences(item.text) <= 2 || normalizeText(item.text).length <= 180) {
-          continue;
-        }
-
-        const plan = await makeSemanticPlan(ctx, item);
-        let rowIndex = 0;
-        if (plan.header) {
-          annotations.push(annotationFromItem(item, "header", plan.header, "", rowIndex));
-          rowIndex += 1;
-        }
-
-        plan.chunks.forEach((chunk) => {
-          annotations.push(annotationFromItem(item, "bullet", chunk.label, chunk.sourceText, rowIndex));
-          rowIndex += 1;
-        });
-
-        summarizedParagraphs += 1;
-      }
-    }
-
-    return jsonResponse({
-      document: {
-        title: body.title || body.filename || "Annotated PDF",
-        fileObjectId: body.fileObjectId || null,
-      },
-      annotations,
-      stats: {
-        pages: pages.length,
-        summarizedParagraphs,
-        annotations: annotations.length,
-      },
-    });
+    const content = aiData?.choices?.[0]?.message?.content || aiData?.content || "";
+    const parsed = extractJson(content);
+    const result = normalizeModelResult(parsed, title, articles);
+    if (!result.articles.length) return json({ error: "The model returned no usable source-linked structure", model }, 502);
+    return json({ ...result, model, usage: aiData.usage || null });
   } catch (error) {
-    console.error(error);
-    return jsonResponse({ error: error.message || "Summarization failed" }, 500);
+    return json({ error: error.message || "Could not parse model output", model }, 502);
   }
 }
