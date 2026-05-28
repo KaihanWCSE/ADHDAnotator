@@ -2,13 +2,13 @@ const APP_ID = "app_jnnlkgx7ehdy";
 const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
-const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
+const DEFAULT_MODEL = "openai/gpt-4.1-mini";
 
 const FALLBACK_MODELS = [
-  { id: "anthropic/claude-haiku-4.5", name: "Claude Haiku 4.5", prompt_price_per_mtok: 0.85, completion_price_per_mtok: 4.25 },
-  { id: "anthropic/claude-sonnet-4.6", name: "Claude Sonnet 4.6", prompt_price_per_mtok: 2.55, completion_price_per_mtok: 12.75 },
-  { id: "openai/gpt-4o-mini", name: "GPT-4o Mini", prompt_price_per_mtok: null, completion_price_per_mtok: null },
-  { id: "google/gemini-2.5-flash", name: "Gemini 2.5 Flash", prompt_price_per_mtok: null, completion_price_per_mtok: null },
+  { id: "openai/gpt-4.1-mini", name: "Balanced - GPT-4.1 Mini", prompt_price_per_mtok: 0.48, completion_price_per_mtok: 1.92 },
+  { id: "google/gemini-3.1-flash-lite", name: "Long PDF - Gemini 3.1 Flash Lite", prompt_price_per_mtok: 0.3, completion_price_per_mtok: 1.8 },
+  { id: "anthropic/claude-sonnet-4.6", name: "High Quality - Claude Sonnet 4.6", prompt_price_per_mtok: 3.6, completion_price_per_mtok: 18 },
+  { id: "anthropic/claude-opus-4.7", name: "Premium - Claude Opus 4.7", prompt_price_per_mtok: 6, completion_price_per_mtok: 30 },
 ];
 
 const state = {
@@ -62,6 +62,10 @@ function countSentences(text) {
   return (text.match(/[.!?]+(?=\s|$)/g) || []).length;
 }
 
+function countWords(text) {
+  return normalizeText(text).split(/\s+/).filter(Boolean).length;
+}
+
 function repairPdfExtractedText(text) {
   return String(text || "")
     .replace(/\ufb00/g, "ff")
@@ -87,6 +91,33 @@ function normalizeForMatch(text) {
 
 function splitIntoSentences(text) {
   return normalizeText(text).match(/[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g)?.map((sentence) => sentence.trim()).filter(Boolean) || [];
+}
+
+function isTitleCaseLike(text) {
+  const words = normalizeText(text).match(/[A-Za-z][A-Za-z'-]*/g) || [];
+  if (!words.length) return false;
+  const titleWords = words.filter((word) => /^[A-Z]/.test(word) || word.length <= 3);
+  return titleWords.length / words.length >= 0.7;
+}
+
+function isLikelyHeaderBlock(block, medianFont = 12) {
+  const text = normalizeText(typeof block === "string" ? block : block?.text);
+  if (!text) return false;
+
+  const words = countWords(text);
+  const sentenceCount = countSentences(text);
+  const fontSize = Number(block?.fontSize) || medianFont;
+  const fontWeight = Number(block?.fontWeight) || 400;
+  const lineCount = block?.lineBoxes?.length || block?.lines?.length || 1;
+  const isEmphasized = fontSize >= medianFont * 1.12 || fontWeight >= 650;
+
+  if (/^\d+[.)]?$/.test(text)) return true;
+  if (/^page\s+\d+$/i.test(text)) return true;
+  if (words <= 10 && /:$/.test(text)) return true;
+  if (words <= 7 && sentenceCount <= 1 && isTitleCaseLike(text) && !/,/.test(text)) return true;
+  if (words <= 9 && sentenceCount === 0 && isTitleCaseLike(text)) return true;
+  if (words <= 12 && sentenceCount <= 1 && lineCount <= 2 && isEmphasized) return true;
+  return false;
 }
 
 function getFontSize(item) {
@@ -143,6 +174,7 @@ function getCurrentBlockText(current) {
 
 function classifyBlock(block, medianFont) {
   const text = block.text.trim();
+  if (isLikelyHeaderBlock(block, medianFont)) return block.fontSize >= medianFont * 1.35 ? "title" : "header";
   if (/^(\u2022|[-*]|[0-9]+[.)])\s+/.test(text)) return "bullet";
   if (block.fontSize >= medianFont * 1.35 && text.length < 120) return "title";
   if (block.fontSize >= medianFont * 1.12 && text.length < 140) return "header";
@@ -208,6 +240,7 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
         width: right - x,
         height: bottom - y,
         fontSize: median(ordered.map((span) => span.fontSize)),
+        fontWeight: median(ordered.map((span) => span.fontWeight)),
         textLength: text.length,
         segments: ordered.map((span) => ({
           id: span.id,
@@ -241,6 +274,7 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
       width: line.width,
       height: line.height,
       fontSize: line.fontSize,
+      fontWeight: line.fontWeight,
       text: line.text,
       textLength: line.textLength,
       segments: line.segments,
@@ -261,8 +295,9 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
     const lineLooksStandalone = lineKind !== "text";
     const normalTextFlow = sameColumn && gap <= medianFont * 2.15;
     const continuationTextFlow = sameColumn && currentKind === "text" && lineKind === "text" && gap <= medianFont * 5.5;
+    const headerBoundary = ["header", "title"].includes(currentKind) && lineKind === "text";
 
-    if (!current || lineLooksStandalone || (!normalTextFlow && !continuationTextFlow)) {
+    if (!current || lineLooksStandalone || headerBoundary || (!normalTextFlow && !continuationTextFlow)) {
       flush();
       current = {
         id: `p${pageNumber}-b${blocks.length}`,
@@ -273,6 +308,7 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
         width: line.width,
         height: line.height,
         fontSize: line.fontSize,
+        fontWeight: line.fontWeight,
       };
       return;
     }
@@ -285,6 +321,7 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
     current.width = right - current.x;
     current.height = bottom - current.y;
     current.fontSize = median(current.lines.map((l) => l.fontSize));
+    current.fontWeight = median(current.lines.map((l) => l.fontWeight));
   });
   flush();
 
@@ -354,8 +391,10 @@ async function uploadPdf(file) {
 
 function isReadableSourceBlock(item) {
   const text = normalizeText(item.text);
-  if (text.length < 35) return false;
-  if (/^\d+$/.test(text)) return false;
+  if (isLikelyHeaderBlock(item)) return false;
+  if (countSentences(text) < 3) return false;
+  if (countWords(text) < 40) return false;
+  if (/^\d+[.)]?$/.test(text)) return false;
   if (/^page\s+\d+$/i.test(text)) return false;
   return ["paragraph", "text", "bullet"].includes(item.kind) || countSentences(text) > 0;
 }
@@ -427,12 +466,13 @@ function getFirstSourceItem(ids, fallbackText = "") {
   return matchedIds.length ? sourceById.get(matchedIds[0]) : null;
 }
 
-function annotationFromPlan(item, kind, label, originalText, index) {
+function annotationFromPlan(item, kind, label, originalText, index, sourceItemIds = [item.id]) {
   const lineHeight = Math.max(20, item.fontSize * 1.55);
   const x = kind === "bullet" ? item.x + Math.max(12, item.fontSize) : item.x;
   return {
     pageNumber: item.pageNumber,
-    sourceItemIds: [item.id],
+    sourceItemIds: coerceIdList(sourceItemIds).length ? coerceIdList(sourceItemIds) : [item.id],
+    anchorItemId: item.id,
     kind,
     label: normalizeText(label).slice(0, 90),
     originalText: kind === "bullet" ? normalizeText(originalText || item.text) : "",
@@ -466,7 +506,7 @@ function annotationsFromStructuredSummary(data) {
         const matchedIds = sourceIds.length ? sourceIds : findSourceIdsForText(block.sourceText, coerceIdList(section.sourceBlockIds));
         const item = getFirstSourceItem(matchedIds, block.sourceText);
         if (!item || !block.bullet) return;
-        annotations.push(annotationFromPlan(item, "bullet", block.bullet, block.sourceText || item.text, nextRow(item.id)));
+        annotations.push(annotationFromPlan(item, "bullet", block.bullet, block.sourceText || item.text, nextRow(item.id), matchedIds.length ? matchedIds : [item.id]));
       });
     });
   });
@@ -477,7 +517,7 @@ function annotationsFromStructuredSummary(data) {
 async function summarizeDocument() {
   const articlePayload = buildArticlePayload();
   if (!articlePayload.articles[0].sourceBlocks.length) {
-    throw new Error("This PDF does not contain enough selectable text to summarize.");
+    throw new Error("This PDF does not contain enough long-form selectable text to summarize.");
   }
 
   setStatus(`Asking ${state.selectedModel} to structure the article...`, 62);
@@ -493,7 +533,8 @@ async function summarizeDocument() {
     }),
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "Summarization failed");
+  if (data.error) throw new Error(data.error);
+  if (!response.ok) throw new Error("Summarization failed");
   state.annotations = annotationsFromStructuredSummary(data);
   if (!state.annotations.length) {
     throw new Error("The model returned no usable source-linked annotations.");
@@ -505,10 +546,10 @@ async function summarizeDocument() {
 function getAnnotationsBySource(pageAnnotations) {
   const annotationsBySource = new Map();
   pageAnnotations.forEach((annotation) => {
-    (annotation.sourceItemIds || []).forEach((sourceId) => {
-      if (!annotationsBySource.has(sourceId)) annotationsBySource.set(sourceId, []);
-      annotationsBySource.get(sourceId).push(annotation);
-    });
+    const sourceId = annotation.anchorItemId || coerceIdList(annotation.sourceItemIds)[0];
+    if (!sourceId) return;
+    if (!annotationsBySource.has(sourceId)) annotationsBySource.set(sourceId, []);
+    annotationsBySource.get(sourceId).push(annotation);
   });
   return annotationsBySource;
 }
@@ -548,8 +589,13 @@ function getSourceSpanIds(source) {
 
 function getSkippedTextSpanIds(pageData, pageAnnotations) {
   const skipped = new Set();
-  getSourceReplacements(pageData, pageAnnotations).forEach(({ source }) => {
-    getSourceSpanIds(source).forEach((spanId) => skipped.add(spanId));
+  const sourceById = new Map(pageData.items.map((item) => [item.id, item]));
+  pageAnnotations.forEach((annotation) => {
+    coerceIdList(annotation.sourceItemIds).forEach((sourceId) => {
+      const source = sourceById.get(sourceId);
+      if (!source) return;
+      getSourceSpanIds(source).forEach((spanId) => skipped.add(spanId));
+    });
   });
   return skipped;
 }
@@ -680,18 +726,20 @@ function layoutReplacementAnnotations(pageData, pageAnnotations) {
     const orderedAnnotations = [...annotations].sort((a, b) => a.y - b.y || a.x - b.x);
     const lineHeight = median(lines.map((line) => line.height));
     const fontSize = Math.max(11, source.fontSize || median(lines.map((line) => line.fontSize)));
+    const annotationLineHeight = Math.max(24, lineHeight, fontSize * 1.9);
 
     orderedAnnotations.forEach((annotation, index) => {
       replacedAnnotations.add(annotation);
       const line = lines[index] || {
         x: source.x,
-        y: source.y + index * lineHeight,
+        y: source.y + index * annotationLineHeight,
         width: source.width,
-        height: lineHeight,
+        height: annotationLineHeight,
         fontSize,
         text: "",
         textLength: 0,
       };
+      const y = Math.max(line.y, source.y + index * annotationLineHeight);
       const indent = annotation.kind === "bullet" ? Math.max(10, fontSize * 0.9) : 0;
       const rightEdge = Math.min(pageData.width, source.x + source.width);
       const maxAvailableWidth = Math.max(24, pageData.width - (line.x + indent) - 8);
@@ -702,9 +750,9 @@ function layoutReplacementAnnotations(pageData, pageAnnotations) {
       positioned.push({
         ...annotation,
         x: line.x + indent,
-        y: line.y,
+        y,
         width: Math.max(24, availableWidth),
-        height: Math.max(18, line.height),
+        height: Math.max(22, annotationLineHeight),
         fontSize: annotation.kind === "header" ? Math.max(14, fontSize * 1.08) : Math.max(12, fontSize * 0.96),
         replacementText: getFixedLengthReplacement(annotation, line.text || source.text),
       });
@@ -769,7 +817,7 @@ async function renderPdfPages() {
     const canvasContext = canvas.getContext("2d");
     await page.render({ canvasContext, viewport }).promise;
     const pageAnnotations = state.annotations.filter((annotation) => annotation.pageNumber === i);
-    const skippedSpanIds = getSkippedTextSpanIds(pageData, pageAnnotations);
+    const skippedSpanIds = getSkippedTextSpanIds(pageData, state.annotations);
     eraseTextSpans(canvasContext, pageData, skippedSpanIds);
     const positionedAnnotations = layoutReplacementAnnotations(pageData, pageAnnotations);
     drawReplacementTexts(canvasContext, positionedAnnotations);
@@ -960,7 +1008,12 @@ function formatModelPrice(model) {
   const input = model.prompt_price_per_mtok;
   const output = model.completion_price_per_mtok;
   if (Number.isFinite(input) && Number.isFinite(output)) {
-    return `$${input}/M in, $${output}/M out`;
+    const formatPrice = (price) => {
+      if (price >= 10) return price.toFixed(0);
+      if (price >= 1) return price.toFixed(2).replace(/\.?0+$/, "");
+      return price.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+    };
+    return `$${formatPrice(input)}/M in, $${formatPrice(output)}/M out`;
   }
   return "Pricing available in Butterbase";
 }
@@ -971,7 +1024,8 @@ function populateModelSelect(models) {
   state.models.forEach((model) => {
     const option = document.createElement("option");
     option.value = model.id;
-    option.textContent = model.name ? `${model.name} (${model.id})` : model.id;
+    option.textContent = model.name || model.id;
+    option.title = model.id;
     els.modelSelect.appendChild(option);
   });
 

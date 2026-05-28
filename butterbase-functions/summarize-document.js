@@ -4,38 +4,36 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
 };
 
-const DEFAULT_MODEL = "anthropic/claude-haiku-4.5";
+const DEFAULT_MODEL = "openai/gpt-4.1-mini";
+const DEFAULT_RETRY_MODEL = "google/gemini-3.1-flash-lite";
 const MAX_SOURCE_CHARS = 85000;
-const MAX_SOURCE_BLOCKS = 160;
+const MAX_SOURCE_BLOCKS = 180;
+const MIN_SOURCE_SENTENCES = 3;
+const MIN_SOURCE_WORDS = 40;
 
-const SYSTEM_PROMPT = `You are an expert reading-comprehension restructuring engine for ADHD-friendly reading.
+const SYSTEM_PROMPT = `You are an expert ADHD-friendly reading structure engine.
 
-Your task is to transform full articles into a structured reading map.
-
-You must do exactly four things:
+You receive articles as numbered sentences. Your job is only:
 1. Divide each article into meaningful sections.
-2. Generate a clear title for each section.
-3. Divide each section into smaller content blocks based on meaning.
-4. Summarize each block into a short bullet label.
+2. Give each section a clear title.
+3. Divide each section into meaning-based bullet ranges.
+4. Give each bullet range a short clickable label.
 
 Important rules:
-- Split by meaning and structure, not mechanically by sentence count.
-- A section may contain one or multiple source blocks.
-- A content block may contain one sentence or multiple sentences.
-- All sections together must cover the entire article.
-- All blocks together must cover the entire section.
-- Preserve the original article order.
-- Do not omit major ideas.
+- Split by meaning and structure, not by fixed sentence count.
+- A section can contain one sentence or many sentences.
+- A bullet can cover one sentence or many adjacent sentences.
+- Preserve the original order.
+- Cover every sentence exactly once with section ranges.
+- Cover every sentence exactly once with bullet ranges.
+- Bullet ranges must stay inside their section range.
+- Do not omit sentences.
 - Do not invent information.
-- Each section must include sourceBlockIds and exact sourceText copied from the input.
-- Each block must include sourceBlockIds and exact sourceText copied from the input.
-- Prefer one sourceBlockId per block when one source block contains the whole idea.
-- If one idea continues across adjacent source blocks, include multiple adjacent sourceBlockIds.
-- Bullet labels should be 3 to 10 words and useful as clickable links.
-- Section titles should be 3 to 8 words and describe the section's main purpose.
-- If uncertain whether content deserves its own block, create a block instead of dropping it.
+- Do not return original source text.
+- Keep bullet labels 3 to 10 words when possible.
+- Keep section titles 3 to 8 words when possible.
 
-Return only valid JSON. Do not include markdown, commentary, explanations, or code fences.`;
+Return only valid compact JSON. No markdown, commentary, code fences, or extra keys.`;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -47,6 +45,10 @@ function json(data, status = 200) {
   });
 }
 
+function validationResult(error, code) {
+  return json({ error, code, skipped: true });
+}
+
 function gatewayBase(ctx) {
   const raw = ctx?.env?.BUTTERBASE_API_URL || "https://api.butterbase.ai";
   return raw.replace(/\/v1\/[^/]+\/?$/, "").replace(/\/$/, "");
@@ -56,8 +58,30 @@ function normalizeText(text) {
   return String(text || "").replace(/\s+/g, " ").trim();
 }
 
-function normalizeForMatch(text) {
-  return normalizeText(text).toLowerCase().replace(/[^\w\s]/g, " ");
+function countWords(text) {
+  return normalizeText(text).split(/\s+/).filter(Boolean).length;
+}
+
+function countSentences(text) {
+  return (normalizeText(text).match(/[.!?]+(?=\s|$)/g) || []).length;
+}
+
+function isTitleCaseLike(text) {
+  const words = normalizeText(text).match(/[A-Za-z][A-Za-z'-]*/g) || [];
+  if (!words.length) return false;
+  const titleWords = words.filter((word) => /^[A-Z]/.test(word) || word.length <= 3);
+  return titleWords.length / words.length >= 0.7;
+}
+
+function isLikelyHeaderBlock(text) {
+  const normalized = normalizeText(text);
+  if (/^\d+[.)]?$/.test(normalized)) return true;
+  if (/^page\s+\d+$/i.test(normalized)) return true;
+  const words = countWords(normalized);
+  if (words <= 10 && /:$/.test(normalized)) return true;
+  if (words <= 7 && countSentences(normalized) <= 1 && isTitleCaseLike(normalized) && !/,/.test(normalized)) return true;
+  if (words <= 9 && countSentences(normalized) === 0 && isTitleCaseLike(normalized)) return true;
+  return false;
 }
 
 function shortLabel(text, maxWords = 10, maxChars = 72) {
@@ -69,12 +93,6 @@ function shortLabel(text, maxWords = 10, maxChars = 72) {
 
 function asArray(value) {
   return Array.isArray(value) ? value : [];
-}
-
-function coerceIdList(value, knownIds) {
-  return asArray(value)
-    .map((id) => String(id))
-    .filter((id) => knownIds.has(id));
 }
 
 function extractJson(text) {
@@ -91,33 +109,27 @@ function extractJson(text) {
   }
 }
 
-function findBlockIdsByText(sourceText, sourceBlocks, allowedIds = []) {
-  const needle = normalizeForMatch(sourceText);
-  if (!needle) return [];
-  const allowed = allowedIds.length ? new Set(allowedIds) : null;
-  const candidates = sourceBlocks.filter((block) => !allowed || allowed.has(block.id));
-
-  const direct = candidates.find((block) => normalizeForMatch(block.text).includes(needle));
-  if (direct) return [direct.id];
-
-  const needleWords = new Set(needle.split(/\s+/).filter((word) => word.length > 3));
-  let best = null;
-  let bestScore = 0;
-  candidates.forEach((block) => {
-    const words = normalizeForMatch(block.text).split(/\s+/);
-    const overlap = words.filter((word) => needleWords.has(word)).length;
-    const score = overlap / Math.max(1, needleWords.size);
-    if (score > bestScore) {
-      best = block;
-      bestScore = score;
-    }
-  });
-
-  return best && bestScore >= 0.35 ? [best.id] : [];
+function splitIntoSentences(text) {
+  const normalized = normalizeText(text);
+  if (!normalized) return [];
+  return normalized.match(/[^.!?]+[.!?]+(?:["')\]]+)?(?:\s+|$)|[^.!?]+$/g)
+    ?.map((sentence) => normalizeText(sentence))
+    .filter(Boolean) || [normalized];
 }
 
-function sourceTextFromIds(ids, byId) {
-  return ids.map((id) => byId.get(id)?.text).filter(Boolean).join(" ");
+function sourceBlockSentences(sourceBlocks) {
+  const sentences = [];
+  sourceBlocks.forEach((block) => {
+    splitIntoSentences(block.text).forEach((sentenceText) => {
+      if (isLikelyHeaderBlock(sentenceText)) return;
+      sentences.push({
+        index: sentences.length + 1,
+        text: sentenceText,
+        sourceBlockId: block.id,
+      });
+    });
+  });
+  return sentences;
 }
 
 function normalizeArticles(rawArticles) {
@@ -131,128 +143,217 @@ function normalizeArticles(rawArticles) {
         kind: String(block.kind || "text"),
         text: normalizeText(block.text),
       }))
-      .filter((block) => block.text.length >= 20);
+      .filter((block) => !isLikelyHeaderBlock(block.text))
+      .filter((block) => splitIntoSentences(block.text).filter((sentence) => !isLikelyHeaderBlock(sentence)).length >= MIN_SOURCE_SENTENCES)
+      .filter((block) => countWords(block.text) >= MIN_SOURCE_WORDS);
 
+    const sentences = sourceBlockSentences(sourceBlocks);
     return {
       articleId: String(article.articleId || `article-${articleIndex + 1}`),
       title: normalizeText(article.title) || `Article ${articleIndex + 1}`,
       sourceBlocks,
+      sentences,
     };
-  }).filter((article) => article.sourceBlocks.length);
+  }).filter((article) => article.sentences.length);
+}
+
+function compactArticlesForPrompt(articles) {
+  return articles.map((article) => ({
+    id: article.articleId,
+    t: article.title,
+    sent: article.sentences.map((sentence) => [sentence.index, sentence.text]),
+  }));
 }
 
 function buildUserPrompt(title, articles) {
-  return `Restructure the following article(s) into ADHD-friendly reading annotations.
-
-Return this exact JSON shape:
+  return `Return this exact compact JSON shape:
 {
-  "document": {
-    "title": "string"
-  },
-  "articles": [
+  "d": "document title",
+  "a": [
     {
-      "articleId": "string",
-      "title": "string",
-      "sections": [
+      "id": "article id from input",
+      "t": "article title",
+      "sec": [
         {
-          "sectionId": "string",
-          "title": "string",
-          "sourceBlockIds": ["string"],
-          "sourceText": "exact original text covered by this section",
-          "blocks": [
-            {
-              "blockId": "string",
-              "bullet": "short clickable bullet summary",
-              "sourceBlockIds": ["string"],
-              "sourceText": "exact original text covered by this block"
-            }
+          "t": "section title",
+          "r": [firstSentenceIndex, lastSentenceIndex],
+          "b": [
+            { "l": "short bullet label", "r": [firstSentenceIndex, lastSentenceIndex] }
           ]
         }
       ]
     }
-  ],
-  "stats": {
-    "sections": number,
-    "blocks": number
-  }
+  ]
 }
 
-Output rules:
-- Each article must have at least one section.
-- Each section must have at least one block.
-- Use only sourceBlockIds that appear in the input.
-- Section sourceText must be copied from the input source blocks.
-- Block sourceText must be copied from the input source blocks.
-- Blocks inside a section should cover the full section sourceText.
-- Do not create bullets for page numbers, footers, or tiny fragments.
-- Keep bullet labels between 3 and 10 words when possible.
-- Keep section titles between 3 and 8 words when possible.
-- Do not include coordinates. The frontend places annotations from sourceBlockIds.
-- Return valid JSON only.
+Range rules:
+- All ranges are inclusive.
+- Ranges must use sentence indexes from the input.
+- Section ranges must cover every sentence exactly once.
+- Bullet ranges must cover every sentence exactly once.
+- Bullet ranges must be adjacent spans inside the section range.
+- Return no source text.
 
 Document title: ${title}
 
-Input articles:
-${JSON.stringify({ articles })}`;
+Input:
+${JSON.stringify({ d: title, a: compactArticlesForPrompt(articles) })}`;
+}
+
+function parseInteger(value) {
+  const number = Number(value);
+  return Number.isInteger(number) ? number : null;
+}
+
+function rangeFromValue(value, label) {
+  if (Array.isArray(value)) {
+    const indexes = value.map(parseInteger);
+    if (indexes.some((index) => index === null)) throw new Error(`${label} has a non-numeric range`);
+    if (indexes.length === 2) {
+      const [start, end] = indexes;
+      if (start > end) throw new Error(`${label} range starts after it ends`);
+      return { start, end };
+    }
+    if (indexes.length > 2) {
+      const sorted = [...indexes].sort((a, b) => a - b);
+      for (let i = 1; i < sorted.length; i += 1) {
+        if (sorted[i] !== sorted[i - 1] + 1) throw new Error(`${label} range is not contiguous`);
+      }
+      return { start: sorted[0], end: sorted[sorted.length - 1] };
+    }
+  }
+
+  if (value && typeof value === "object") {
+    const start = parseInteger(value.start ?? value.first ?? value.from);
+    const end = parseInteger(value.end ?? value.last ?? value.to ?? value.ends_after);
+    if (start !== null && end !== null && start <= end) return { start, end };
+  }
+
+  throw new Error(`${label} is missing a valid sentence range`);
+}
+
+function indexesForRange(range) {
+  return Array.from({ length: range.end - range.start + 1 }, (_, index) => range.start + index);
+}
+
+function rangeInside(child, parent) {
+  return child.start >= parent.start && child.end <= parent.end;
+}
+
+function uniqueSourceIdsForIndexes(article, indexes) {
+  const byIndex = new Map(article.sentences.map((sentence) => [sentence.index, sentence]));
+  return [...new Set(indexes.map((index) => byIndex.get(index)?.sourceBlockId).filter(Boolean))];
+}
+
+function textForIndexes(article, indexes) {
+  const byIndex = new Map(article.sentences.map((sentence) => [sentence.index, sentence]));
+  return indexes.map((index) => byIndex.get(index)?.text).filter(Boolean).join(" ");
+}
+
+function addCoverage(coverage, indexes, validIndexes, label) {
+  indexes.forEach((index) => {
+    if (!validIndexes.has(index)) throw new Error(`${label} references missing sentence ${index}`);
+    if (coverage.has(index)) throw new Error(`${label} overlaps sentence ${index}`);
+    coverage.add(index);
+  });
+}
+
+function ensureCovered(requiredIndexes, coverage, label) {
+  const missing = requiredIndexes.filter((index) => !coverage.has(index));
+  if (missing.length) throw new Error(`${label} missed sentence ${missing[0]}`);
+}
+
+function sectionsFromArticleResult(articleResult) {
+  return asArray(articleResult?.sections || articleResult?.sec || articleResult?.s);
+}
+
+function bulletsFromSectionResult(sectionResult) {
+  return asArray(sectionResult?.bullets || sectionResult?.blocks || sectionResult?.b);
+}
+
+function rangeValueFromResult(result, previousEnd = null) {
+  const explicit = result?.range || result?.sentenceRange || result?.r || result?.sentences;
+  if (explicit) return explicit;
+  const end = parseInteger(result?.end ?? result?.ends_after);
+  if (end !== null && previousEnd !== null) return [previousEnd + 1, end];
+  return null;
 }
 
 function normalizeModelResult(parsed, title, inputArticles) {
-  const inputByArticle = new Map(inputArticles.map((article) => [article.articleId, article]));
+  const parsedArticles = asArray(parsed.articles || parsed.a);
   let totalSections = 0;
   let totalBlocks = 0;
 
-  const articles = asArray(parsed.articles).map((article, articleIndex) => {
-    const inputArticle = inputByArticle.get(String(article.articleId)) || inputArticles[articleIndex] || inputArticles[0];
-    const byId = new Map(inputArticle.sourceBlocks.map((block) => [block.id, block]));
-    const knownIds = new Set(byId.keys());
+  const articles = inputArticles.map((inputArticle, articleIndex) => {
+    const articleResult = parsedArticles.find((candidate) => String(candidate.articleId || candidate.id) === inputArticle.articleId)
+      || parsedArticles[articleIndex]
+      || {};
+    const validIndexes = new Set(inputArticle.sentences.map((sentence) => sentence.index));
+    const allIndexes = inputArticle.sentences.map((sentence) => sentence.index);
+    const sectionCoverage = new Set();
+    const bulletCoverage = new Set();
+    let previousSectionEnd = 0;
 
-    const sections = asArray(article.sections).map((section, sectionIndex) => {
-      let sectionIds = coerceIdList(section.sourceBlockIds, knownIds);
-      if (!sectionIds.length) sectionIds = findBlockIdsByText(section.sourceText, inputArticle.sourceBlocks);
+    const sections = sectionsFromArticleResult(articleResult).map((section, sectionIndex) => {
+      const sectionRange = rangeFromValue(rangeValueFromResult(section, previousSectionEnd), `section ${sectionIndex + 1}`);
+      previousSectionEnd = sectionRange.end;
+      const sectionIndexes = indexesForRange(sectionRange);
+      addCoverage(sectionCoverage, sectionIndexes, validIndexes, `section ${sectionIndex + 1}`);
 
-      const blocks = asArray(section.blocks).map((block, blockIndex) => {
-        let blockIds = coerceIdList(block.sourceBlockIds, knownIds);
-        if (!blockIds.length) blockIds = findBlockIdsByText(block.sourceText, inputArticle.sourceBlocks, sectionIds);
-        if (!blockIds.length) return null;
+      const sectionBulletCoverage = new Set();
+      const blocks = bulletsFromSectionResult(section).map((bullet, bulletIndex) => {
+        const bulletRange = rangeFromValue(rangeValueFromResult(bullet), `section ${sectionIndex + 1} bullet ${bulletIndex + 1}`);
+        if (!rangeInside(bulletRange, sectionRange)) {
+          throw new Error(`section ${sectionIndex + 1} bullet ${bulletIndex + 1} is outside its section range`);
+        }
 
-        const sourceText = normalizeText(block.sourceText) || sourceTextFromIds(blockIds, byId);
-        const bullet = shortLabel(block.bullet || block.label || `Point ${blockIndex + 1}`);
-        if (!sourceText || !bullet) return null;
+        const bulletIndexes = indexesForRange(bulletRange);
+        addCoverage(sectionBulletCoverage, bulletIndexes, validIndexes, `section ${sectionIndex + 1} bullet coverage`);
+        addCoverage(bulletCoverage, bulletIndexes, validIndexes, `article ${articleIndex + 1} bullet coverage`);
 
+        const sourceBlockIds = uniqueSourceIdsForIndexes(inputArticle, bulletIndexes);
+        const sourceText = textForIndexes(inputArticle, bulletIndexes);
+        const bulletLabel = shortLabel(bullet.bullet || bullet.label || bullet.l || `Point ${bulletIndex + 1}`);
+        if (!sourceBlockIds.length || !sourceText || !bulletLabel) return null;
+
+        totalBlocks += 1;
         return {
-          blockId: String(block.blockId || `${inputArticle.articleId}-s${sectionIndex + 1}-b${blockIndex + 1}`),
-          bullet,
-          sourceBlockIds: blockIds,
+          blockId: String(bullet.blockId || bullet.id || `${inputArticle.articleId}-s${sectionIndex + 1}-b${bulletIndex + 1}`),
+          bullet: bulletLabel,
+          sourceBlockIds,
           sourceText,
+          sentenceRange: [bulletRange.start, bulletRange.end],
         };
       }).filter(Boolean);
 
-      if (!sectionIds.length) {
-        sectionIds = [...new Set(blocks.flatMap((block) => block.sourceBlockIds))];
-      }
-      if (!sectionIds.length || !blocks.length) return null;
+      ensureCovered(sectionIndexes, sectionBulletCoverage, `section ${sectionIndex + 1} bullets`);
+      if (!blocks.length) throw new Error(`section ${sectionIndex + 1} has no valid bullets`);
 
       totalSections += 1;
-      totalBlocks += blocks.length;
       return {
-        sectionId: String(section.sectionId || `${inputArticle.articleId}-s${sectionIndex + 1}`),
-        title: shortLabel(section.title || `Section ${sectionIndex + 1}`, 8, 70),
-        sourceBlockIds: sectionIds,
-        sourceText: normalizeText(section.sourceText) || sourceTextFromIds(sectionIds, byId),
+        sectionId: String(section.sectionId || section.id || `${inputArticle.articleId}-s${sectionIndex + 1}`),
+        title: shortLabel(section.title || section.t || `Section ${sectionIndex + 1}`, 8, 70),
+        sourceBlockIds: uniqueSourceIdsForIndexes(inputArticle, sectionIndexes),
+        sourceText: textForIndexes(inputArticle, sectionIndexes),
+        sentenceRange: [sectionRange.start, sectionRange.end],
         blocks,
       };
-    }).filter(Boolean);
+    });
+
+    ensureCovered(allIndexes, sectionCoverage, `article ${articleIndex + 1} sections`);
+    ensureCovered(allIndexes, bulletCoverage, `article ${articleIndex + 1} bullets`);
+    if (!sections.length) throw new Error(`article ${articleIndex + 1} has no valid sections`);
 
     return {
       articleId: inputArticle.articleId,
-      title: normalizeText(article.title) || inputArticle.title,
+      title: normalizeText(articleResult.title || articleResult.t) || inputArticle.title,
       sections,
     };
-  }).filter((article) => article.sections.length);
+  });
 
   return {
     document: {
-      title: normalizeText(parsed?.document?.title) || title,
+      title: normalizeText(parsed?.document?.title || parsed?.d) || title,
     },
     articles,
     stats: {
@@ -260,6 +361,38 @@ function normalizeModelResult(parsed, title, inputArticles) {
       blocks: totalBlocks,
     },
   };
+}
+
+async function requestSummary({ ctx, appId, apiKey, model, title, articles }) {
+  const response = await fetch(`${gatewayBase(ctx)}/v1/${appId}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      temperature: 0.1,
+      max_tokens: 6000,
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: buildUserPrompt(title, articles) },
+      ],
+    }),
+  });
+
+  const aiData = await response.json();
+  if (!response.ok) {
+    const error = new Error(aiData?.error?.message || aiData?.error || "Butterbase AI request failed");
+    error.status = response.status;
+    throw error;
+  }
+
+  const content = aiData?.choices?.[0]?.message?.content || aiData?.content || "";
+  const parsed = extractJson(content);
+  const result = normalizeModelResult(parsed, title, articles);
+  if (!result.articles.length) throw new Error("The model returned no usable sentence-linked structure");
+  return { result, usage: aiData.usage || null };
 }
 
 export default async function handler(req, ctx) {
@@ -275,52 +408,51 @@ export default async function handler(req, ctx) {
 
   const title = normalizeText(body.title || body.filename || "Uploaded PDF");
   const articles = normalizeArticles(body.articles);
-  if (!articles.length) return json({ error: "No readable article text was provided" }, 400);
+  if (!articles.length) {
+    return validationResult("No readable long-form article text was provided", "not_enough_readable_text");
+  }
 
   const sourceChars = articles.reduce((sum, article) => (
     sum + article.sourceBlocks.reduce((inner, block) => inner + block.text.length, 0)
   ), 0);
   if (sourceChars > MAX_SOURCE_CHARS) {
-    return json({ error: "This PDF has too much extracted text for one AI request. Try a shorter PDF for now." }, 413);
+    return validationResult("This PDF has too much extracted text for one AI request. Try a shorter PDF for now.", "too_much_text");
   }
 
   const apiKey = ctx?.env?.BUTTERBASE_API_KEY;
   if (!apiKey) return json({ error: "Butterbase AI API key is not configured for this function" }, 500);
 
   const appId = ctx?.env?.BUTTERBASE_APP_ID || "app_jnnlkgx7ehdy";
-  const model = normalizeText(body.model) || DEFAULT_MODEL;
-  const response = await fetch(`${gatewayBase(ctx)}/v1/${appId}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.15,
-      max_tokens: 8000,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: buildUserPrompt(title, articles) },
-      ],
-    }),
-  });
+  const requestedModel = normalizeText(body.model) || DEFAULT_MODEL;
+  const modelsToTry = requestedModel === DEFAULT_MODEL ? [DEFAULT_MODEL, DEFAULT_RETRY_MODEL] : [requestedModel];
+  const errors = [];
 
-  const aiData = await response.json();
-  if (!response.ok) {
-    return json({
-      error: aiData?.error?.message || aiData?.error || "Butterbase AI request failed",
-      model,
-    }, response.status);
+  for (const model of modelsToTry) {
+    try {
+      const { result, usage } = await requestSummary({ ctx, appId, apiKey, model, title, articles });
+      return json({
+        ...result,
+        model,
+        originalModel: requestedModel,
+        fallbackUsed: model !== requestedModel,
+        attemptedModels: modelsToTry.slice(0, modelsToTry.indexOf(model) + 1),
+        usage,
+      });
+    } catch (error) {
+      errors.push({
+        model,
+        message: error.message || "Unknown AI error",
+        status: error.status || 502,
+      });
+    }
   }
 
-  try {
-    const content = aiData?.choices?.[0]?.message?.content || aiData?.content || "";
-    const parsed = extractJson(content);
-    const result = normalizeModelResult(parsed, title, articles);
-    if (!result.articles.length) return json({ error: "The model returned no usable source-linked structure", model }, 502);
-    return json({ ...result, model, usage: aiData.usage || null });
-  } catch (error) {
-    return json({ error: error.message || "Could not parse model output", model }, 502);
-  }
+  const lastError = errors[errors.length - 1];
+  return json({
+    error: lastError?.message || "AI summarization failed",
+    model: requestedModel,
+    fallbackModel: requestedModel === DEFAULT_MODEL ? DEFAULT_RETRY_MODEL : null,
+    attemptedModels: modelsToTry,
+    attempts: errors,
+  }, lastError?.status || 502);
 }

@@ -5,15 +5,18 @@ const CORS_HEADERS = {
 };
 
 const PREFERRED_MODELS = [
-  "anthropic/claude-haiku-4.5",
+  "openai/gpt-4.1-mini",
+  "google/gemini-3.1-flash-lite",
   "anthropic/claude-sonnet-4.6",
-  "anthropic/claude-sonnet-4.5",
-  "openai/gpt-4o-mini",
-  "openai/gpt-4o",
-  "google/gemini-2.5-flash",
-  "google/gemini-2.5-pro",
-  "meta-llama/llama-3.1-70b-instruct",
+  "anthropic/claude-opus-4.7",
 ];
+
+const MODEL_LABELS = {
+  "openai/gpt-4.1-mini": "Balanced - GPT-4.1 Mini",
+  "google/gemini-3.1-flash-lite": "Long PDF - Gemini 3.1 Flash Lite",
+  "anthropic/claude-sonnet-4.6": "High Quality - Claude Sonnet 4.6",
+  "anthropic/claude-opus-4.7": "Premium - Claude Opus 4.7",
+};
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -33,7 +36,7 @@ function gatewayBase(ctx) {
 function presentModel(model) {
   return {
     id: model.id,
-    name: model.name || model.display_name || model.id,
+    name: MODEL_LABELS[model.id] || model.name || model.display_name || model.id,
     context_length: model.context_length || model.contextWindow || null,
     modality: model.modality || "chat",
     prompt_price_per_mtok: model.prompt_price_per_mtok ?? model.inputPricePerMTokens ?? null,
