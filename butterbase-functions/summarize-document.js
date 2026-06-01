@@ -10,6 +10,8 @@ const MAX_SOURCE_CHARS = 85000;
 const MAX_SOURCE_BLOCKS = 180;
 const MIN_SOURCE_SENTENCES = 3;
 const MIN_SOURCE_WORDS = 40;
+const DEBUG_CAPTURE_PREFIX = "debug-ai-runs";
+const DEBUG_CAPTURE_CONTENT_TYPE = "application/json";
 
 const SYSTEM_PROMPT = `You are an expert ADHD-friendly reading structure engine.
 
@@ -52,6 +54,10 @@ function validationResult(error, code) {
 function gatewayBase(ctx) {
   const raw = ctx?.env?.BUTTERBASE_API_URL || "https://api.butterbase.ai";
   return raw.replace(/\/v1\/[^/]+\/?$/, "").replace(/\/$/, "");
+}
+
+function debugEnabled(ctx) {
+  return String(ctx?.env?.AI_DEBUG_CAPTURE_ENABLED ?? "true").toLowerCase() !== "false";
 }
 
 function normalizeText(text) {
@@ -363,7 +369,127 @@ function normalizeModelResult(parsed, title, inputArticles) {
   };
 }
 
+function byteLength(text) {
+  return new TextEncoder().encode(text).length;
+}
+
+function filenameSafe(value, maxLength = 80) {
+  const safe = normalizeText(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, maxLength);
+  return safe || "untitled";
+}
+
+function debugFilename({ timestamp, title, model, status }) {
+  const safeTime = timestamp.replace(/[:.]/g, "-");
+  return `${DEBUG_CAPTURE_PREFIX}/${safeTime}-${filenameSafe(status, 20)}-${filenameSafe(model, 64)}-${filenameSafe(title)}.json`;
+}
+
+async function uploadJsonToStorage({ ctx, appId, apiKey, filename, data }) {
+  const jsonText = JSON.stringify(data, null, 2);
+  const uploadResponse = await fetch(`${gatewayBase(ctx)}/storage/${appId}/upload`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      filename,
+      contentType: DEBUG_CAPTURE_CONTENT_TYPE,
+      sizeBytes: byteLength(jsonText),
+    }),
+  });
+  const uploadData = await uploadResponse.json();
+  if (!uploadResponse.ok) {
+    throw new Error(uploadData?.error?.message || uploadData?.error || "Could not create debug upload URL");
+  }
+
+  const putResponse = await fetch(uploadData.uploadUrl, {
+    method: "PUT",
+    headers: { "Content-Type": DEBUG_CAPTURE_CONTENT_TYPE },
+    body: jsonText,
+  });
+  if (!putResponse.ok) throw new Error("Could not upload debug capture JSON");
+
+  return {
+    objectId: uploadData.objectId || uploadData.object_id || null,
+    objectKey: uploadData.objectKey || uploadData.object_key || null,
+    filename,
+    sizeBytes: byteLength(jsonText),
+  };
+}
+
+async function saveAiDebugCapture({ ctx, appId, apiKey, title, filename, requestedModel, model, status, articles, prompt, aiData, rawContent, parsed, result, usage, error, attemptIndex }) {
+  if (!debugEnabled(ctx) || !apiKey) return null;
+
+  const timestamp = new Date().toISOString();
+  const capture = {
+    schemaVersion: 1,
+    capturedAt: timestamp,
+    status,
+    appId,
+    request: {
+      title,
+      filename,
+      requestedModel,
+      model,
+      attemptIndex,
+    },
+    debug: {
+      storagePrefix: DEBUG_CAPTURE_PREFIX,
+    },
+    input: {
+      articles,
+      prompt,
+    },
+    ai: {
+      rawContent,
+      parsed,
+      usage: usage || aiData?.usage || null,
+      responseMetadata: {
+        id: aiData?.id || null,
+        model: aiData?.model || null,
+        object: aiData?.object || null,
+        created: aiData?.created || null,
+      },
+    },
+    backend: {
+      normalizedResult: result || null,
+      error: error ? {
+        message: error.message || String(error),
+        status: error.status || null,
+        stack: error.stack || null,
+      } : null,
+    },
+  };
+
+  try {
+    const savedCapture = await uploadJsonToStorage({
+      ctx,
+      appId,
+      apiKey,
+      filename: debugFilename({ timestamp, title, model, status }),
+      data: capture,
+    });
+    console.info("AI debug capture saved", JSON.stringify({
+      status,
+      model,
+      objectId: savedCapture.objectId,
+      objectKey: savedCapture.objectKey,
+      filename: savedCapture.filename,
+      sizeBytes: savedCapture.sizeBytes,
+    }));
+    return savedCapture;
+  } catch (captureError) {
+    console.warn("AI debug capture failed", captureError?.message || captureError);
+    return null;
+  }
+}
+
 async function requestSummary({ ctx, appId, apiKey, model, title, articles }) {
+  const prompt = buildUserPrompt(title, articles);
   const response = await fetch(`${gatewayBase(ctx)}/v1/${appId}/chat/completions`, {
     method: "POST",
     headers: {
@@ -376,7 +502,7 @@ async function requestSummary({ ctx, appId, apiKey, model, title, articles }) {
       max_tokens: 6000,
       messages: [
         { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: buildUserPrompt(title, articles) },
+        { role: "user", content: prompt },
       ],
     }),
   });
@@ -385,14 +511,35 @@ async function requestSummary({ ctx, appId, apiKey, model, title, articles }) {
   if (!response.ok) {
     const error = new Error(aiData?.error?.message || aiData?.error || "Butterbase AI request failed");
     error.status = response.status;
+    error.debugCapture = {
+      prompt,
+      aiData,
+      rawContent: null,
+      parsed: null,
+      result: null,
+    };
     throw error;
   }
 
   const content = aiData?.choices?.[0]?.message?.content || aiData?.content || "";
-  const parsed = extractJson(content);
-  const result = normalizeModelResult(parsed, title, articles);
-  if (!result.articles.length) throw new Error("The model returned no usable sentence-linked structure");
-  return { result, usage: aiData.usage || null };
+  let parsed = null;
+  let result = null;
+  try {
+    parsed = extractJson(content);
+    result = normalizeModelResult(parsed, title, articles);
+    if (!result.articles.length) throw new Error("The model returned no usable sentence-linked structure");
+  } catch (error) {
+    error.debugCapture = {
+      prompt,
+      aiData,
+      rawContent: content,
+      parsed,
+      result,
+    };
+    throw error;
+  }
+
+  return { result, usage: aiData.usage || null, prompt, aiData, rawContent: content, parsed };
 }
 
 export default async function handler(req, ctx) {
@@ -427,9 +574,27 @@ export default async function handler(req, ctx) {
   const modelsToTry = requestedModel === DEFAULT_MODEL ? [DEFAULT_MODEL, DEFAULT_RETRY_MODEL] : [requestedModel];
   const errors = [];
 
-  for (const model of modelsToTry) {
+  for (const [attemptIndex, model] of modelsToTry.entries()) {
     try {
-      const { result, usage } = await requestSummary({ ctx, appId, apiKey, model, title, articles });
+      const { result, usage, prompt, aiData, rawContent, parsed } = await requestSummary({ ctx, appId, apiKey, model, title, articles });
+      await saveAiDebugCapture({
+        ctx,
+        appId,
+        apiKey,
+        title,
+        filename: body.filename,
+        requestedModel,
+        model,
+        status: "success",
+        articles,
+        prompt,
+        aiData,
+        rawContent,
+        parsed,
+        result,
+        usage,
+        attemptIndex,
+      });
       return json({
         ...result,
         model,
@@ -439,6 +604,28 @@ export default async function handler(req, ctx) {
         usage,
       });
     } catch (error) {
+      const debugCaptureData = error.debugCapture;
+      if (debugCaptureData) {
+        await saveAiDebugCapture({
+          ctx,
+          appId,
+          apiKey,
+          title,
+          filename: body.filename,
+          requestedModel,
+          model,
+          status: "error",
+          articles,
+          prompt: debugCaptureData.prompt,
+          aiData: debugCaptureData.aiData,
+          rawContent: debugCaptureData.rawContent,
+          parsed: debugCaptureData.parsed,
+          result: debugCaptureData.result,
+          usage: debugCaptureData.aiData?.usage || null,
+          error,
+          attemptIndex,
+        });
+      }
       errors.push({
         model,
         message: error.message || "Unknown AI error",

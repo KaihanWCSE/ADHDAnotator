@@ -162,6 +162,85 @@ function textBlocksOverlap(a, b) {
   return overlap / Math.max(1, Math.min(a.width, b.width));
 }
 
+function numericTokenRatio(text) {
+  const tokens = normalizeText(text).split(/\s+/).filter(Boolean);
+  if (!tokens.length) return 0;
+  const numericTokens = tokens.filter((token) => /[\d%$=<>/]/.test(token));
+  return numericTokens.length / tokens.length;
+}
+
+function splitLineSpansIntoRuns(orderedSpans, medianFont, pageWidth) {
+  const runs = [];
+  let currentRun = [];
+  let currentRight = null;
+  const gapThreshold = Math.max(medianFont * 4.5, Math.min(76, pageWidth * 0.055));
+
+  orderedSpans.forEach((span) => {
+    const gap = currentRight === null ? 0 : span.x - currentRight;
+    if (currentRun.length && gap > gapThreshold) {
+      runs.push(currentRun);
+      currentRun = [];
+      currentRight = null;
+    }
+
+    currentRun.push(span);
+    const spanRight = span.x + span.width;
+    currentRight = currentRight === null ? spanRight : Math.max(currentRight, spanRight);
+  });
+
+  if (currentRun.length) runs.push(currentRun);
+  return runs;
+}
+
+function isLikelyTableRow(runs, rowText) {
+  const sentenceCount = countSentences(rowText);
+  const rowWords = countWords(rowText);
+  const compactRuns = runs.filter((run) => countWords(run.map((span) => span.text).join(" ")) <= 7).length;
+  const numericRuns = runs.filter((run) => numericTokenRatio(run.map((span) => span.text).join(" ")) >= 0.34).length;
+
+  if (runs.length >= 3 && compactRuns >= Math.ceil(runs.length * 0.6) && sentenceCount <= 1) return true;
+  if (runs.length >= 3 && sentenceCount === 0 && rowWords <= 24) return true;
+  if (runs.length >= 2 && numericRuns >= 1 && compactRuns === runs.length && rowWords <= 14) return true;
+  return false;
+}
+
+function buildLineFromSpans(ordered, id, tableLike, rowRunCount) {
+  const text = normalizeText(ordered.map((span) => span.text).join(" "));
+  const x = Math.min(...ordered.map((span) => span.x));
+  const y = Math.min(...ordered.map((span) => span.y));
+  const right = Math.max(...ordered.map((span) => span.x + span.width));
+  const bottom = Math.max(...ordered.map((span) => span.y + span.height));
+
+  return {
+    id,
+    text,
+    x,
+    y,
+    width: right - x,
+    height: bottom - y,
+    fontSize: median(ordered.map((span) => span.fontSize)),
+    fontWeight: median(ordered.map((span) => span.fontWeight)),
+    textLength: text.length,
+    tableLike,
+    rowRunCount,
+    segments: ordered.map((span) => ({
+      id: span.id,
+      x: span.x,
+      y: span.y,
+      baselineY: span.baselineY,
+      width: span.width,
+      height: span.height,
+      fontSize: span.fontSize,
+      fontFamily: span.fontFamily,
+      fontName: span.fontName,
+      fontStyle: span.fontStyle,
+      fontWeight: span.fontWeight,
+      text: span.text,
+      textLength: span.textLength,
+    })),
+  };
+}
+
 function isSameTextColumn(current, line, medianFont) {
   if (!current) return false;
   const currentBox = { x: current.x, width: current.width };
@@ -180,6 +259,148 @@ function classifyBlock(block, medianFont) {
   if (block.fontSize >= medianFont * 1.12 && text.length < 140) return "header";
   if (countSentences(text) > 2 && text.length > 180) return "paragraph";
   return "text";
+}
+
+function isPageWideLine(line, pageWidth, medianFont) {
+  const center = line.x + line.width / 2;
+  const centered = Math.abs(center - pageWidth / 2) <= pageWidth * 0.12;
+  return line.width >= pageWidth * 0.68 || (centered && line.width >= pageWidth * 0.42 && line.fontSize >= medianFont * 1.08);
+}
+
+function summarizeColumn(lines) {
+  const lefts = lines.map((line) => line.x);
+  const rights = lines.map((line) => line.x + line.width);
+  return {
+    lines,
+    x: median(lefts),
+    right: median(rights),
+    minX: Math.min(...lefts),
+    maxRight: Math.max(...rights),
+    top: Math.min(...lines.map((line) => line.y)),
+    bottom: Math.max(...lines.map((line) => line.y + line.height)),
+  };
+}
+
+function detectTextColumns(lines, pageWidth, medianFont) {
+  const candidates = lines
+    .filter((line) => !line.tableLike)
+    .filter((line) => !isPageWideLine(line, pageWidth, medianFont))
+    .filter((line) => line.textLength >= 18 && line.width >= medianFont * 7)
+    .filter((line) => line.width <= pageWidth * 0.64);
+
+  if (candidates.length < 6) return [];
+
+  const columns = [];
+  const xTolerance = Math.max(medianFont * 5, pageWidth * 0.045);
+
+  [...candidates].sort((a, b) => a.x - b.x).forEach((line) => {
+    let bestColumn = null;
+    let bestScore = 0;
+
+    columns.forEach((column) => {
+      const columnBox = { x: column.minX, width: column.maxRight - column.minX };
+      const overlap = textBlocksOverlap(columnBox, line);
+      const leftDiff = Math.abs(line.x - column.x);
+      const score = overlap + (leftDiff <= xTolerance ? 1 - (leftDiff / xTolerance) : 0);
+      if (score > bestScore) {
+        bestScore = score;
+        bestColumn = column;
+      }
+    });
+
+    if (bestColumn && bestScore >= 0.28) {
+      bestColumn.lines.push(line);
+      Object.assign(bestColumn, summarizeColumn(bestColumn.lines));
+      return;
+    }
+
+    columns.push(summarizeColumn([line]));
+  });
+
+  const usableColumns = columns
+    .filter((column) => column.lines.length >= 3)
+    .sort((a, b) => a.x - b.x);
+
+  if (usableColumns.length < 2) return [];
+
+  const hasColumnGutter = usableColumns.some((column, index) => {
+    if (index === 0) return false;
+    return column.x - usableColumns[index - 1].right >= Math.max(medianFont * 4, pageWidth * 0.055);
+  });
+
+  return hasColumnGutter ? usableColumns : [];
+}
+
+function columnIndexForLine(line, columns, pageWidth, medianFont) {
+  if (!columns.length || line.tableLike || isPageWideLine(line, pageWidth, medianFont)) return null;
+
+  const center = line.x + line.width / 2;
+  const tolerance = Math.max(medianFont * 5, pageWidth * 0.045);
+  let bestIndex = null;
+  let bestScore = 0;
+
+  columns.forEach((column, index) => {
+    const columnBox = { x: column.minX, width: column.maxRight - column.minX };
+    const overlap = textBlocksOverlap(columnBox, line);
+    const centerInside = center >= column.minX - tolerance && center <= column.maxRight + tolerance;
+    const leftClose = Math.abs(line.x - column.x) <= tolerance;
+    const score = overlap + (centerInside ? 0.45 : 0) + (leftClose ? 0.25 : 0);
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = index;
+    }
+  });
+
+  return bestScore >= 0.3 ? bestIndex : null;
+}
+
+function sortLinesForReadingOrder(lines, pageWidth, medianFont) {
+  const naturalOrder = [...lines].sort((a, b) => a.y - b.y || a.x - b.x);
+  const columns = detectTextColumns(naturalOrder, pageWidth, medianFont);
+  if (columns.length < 2) return naturalOrder;
+
+  const wideAnchors = naturalOrder.filter((line) => isPageWideLine(line, pageWidth, medianFont));
+  const anchorIndexById = new Map(wideAnchors.map((line, index) => [line.id, index]));
+  const bandThreshold = medianFont * 0.75;
+
+  const keyForLine = (line) => {
+    const anchorIndex = anchorIndexById.get(line.id);
+    if (anchorIndex !== undefined) return [anchorIndex * 2 + 1, 0, line.y, line.x];
+
+    const band = wideAnchors.filter((anchor) => anchor.y + anchor.height < line.y - bandThreshold).length;
+    const columnIndex = columnIndexForLine(line, columns, pageWidth, medianFont);
+    if (columnIndex !== null) return [band * 2, 1, columnIndex, line.y, line.x];
+    return [band * 2, 2, line.y, line.x];
+  };
+
+  return naturalOrder.sort((a, b) => {
+    const aKey = keyForLine(a);
+    const bKey = keyForLine(b);
+    const maxLength = Math.max(aKey.length, bKey.length);
+    for (let index = 0; index < maxLength; index += 1) {
+      const difference = (aKey[index] ?? 0) - (bKey[index] ?? 0);
+      if (difference) return difference;
+    }
+    return 0;
+  });
+}
+
+function isLikelyTableBlock(block) {
+  const lines = block.lineBoxes || block.lines || [];
+  if (lines.length < 2) return false;
+
+  const text = normalizeText(block.text || lines.map((line) => line.text).join(" "));
+  const sentenceCount = countSentences(text);
+  const tableLineCount = lines.filter((line) => line.tableLike).length;
+  const shortLineCount = lines.filter((line) => countWords(line.text) <= 8 && countSentences(line.text) === 0).length;
+  const averageWordsPerLine = countWords(text) / Math.max(1, lines.length);
+  const numberRatio = numericTokenRatio(text);
+
+  if (tableLineCount >= 2 && tableLineCount / lines.length >= 0.45 && sentenceCount <= Math.max(1, Math.floor(lines.length / 2))) return true;
+  if (lines.length >= 3 && shortLineCount / lines.length >= 0.75 && numberRatio >= 0.25 && sentenceCount <= 1) return true;
+  if (lines.length >= 3 && averageWordsPerLine <= 7 && numberRatio >= 0.35) return true;
+  return false;
 }
 
 function median(values) {
@@ -224,42 +445,20 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
     lineMap.get(key).push(span);
   });
 
-  const lines = [...lineMap.values()]
-    .map((lineSpans, index) => {
+  let lineIndex = 0;
+  const naturalLines = [...lineMap.entries()]
+    .sort(([a], [b]) => a - b)
+    .flatMap(([, lineSpans]) => {
       const ordered = lineSpans.sort((a, b) => a.x - b.x);
-      const text = normalizeText(ordered.map((span) => span.text).join(" "));
-      const x = Math.min(...ordered.map((span) => span.x));
-      const y = Math.min(...ordered.map((span) => span.y));
-      const right = Math.max(...ordered.map((span) => span.x + span.width));
-      const bottom = Math.max(...ordered.map((span) => span.y + span.height));
-      return {
-        id: `p${pageNumber}-l${index}`,
-        text,
-        x,
-        y,
-        width: right - x,
-        height: bottom - y,
-        fontSize: median(ordered.map((span) => span.fontSize)),
-        fontWeight: median(ordered.map((span) => span.fontWeight)),
-        textLength: text.length,
-        segments: ordered.map((span) => ({
-          id: span.id,
-          x: span.x,
-          y: span.y,
-          baselineY: span.baselineY,
-          width: span.width,
-          height: span.height,
-          fontSize: span.fontSize,
-          fontFamily: span.fontFamily,
-          fontName: span.fontName,
-          fontStyle: span.fontStyle,
-          fontWeight: span.fontWeight,
-          text: span.text,
-          textLength: span.textLength,
-        })),
-      };
-    })
-    .sort((a, b) => a.y - b.y || a.x - b.x);
+      const runs = splitLineSpansIntoRuns(ordered, medianFont, viewport.width);
+      const rowText = normalizeText(ordered.map((span) => span.text).join(" "));
+      const rowLooksTableLike = isLikelyTableRow(runs, rowText);
+      return runs.map((run) => {
+        lineIndex += 1;
+        return buildLineFromSpans(run, `p${pageNumber}-l${lineIndex}`, rowLooksTableLike, runs.length);
+      });
+    });
+  const lines = sortLinesForReadingOrder(naturalLines, viewport.width, medianFont);
 
   const blocks = [];
   let current = null;
@@ -277,10 +476,13 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
       fontWeight: line.fontWeight,
       text: line.text,
       textLength: line.textLength,
+      tableLike: Boolean(line.tableLike),
+      rowRunCount: line.rowRunCount || 1,
       segments: line.segments,
     }));
     current.spanIds = current.lineBoxes.flatMap((line) => line.segments.map((segment) => segment.id));
-    current.kind = classifyBlock(current, medianFont);
+    current.tableLike = isLikelyTableBlock(current);
+    current.kind = current.tableLike ? "table" : classifyBlock(current, medianFont);
     delete current.lines;
     blocks.push(current);
     current = null;
@@ -391,6 +593,7 @@ async function uploadPdf(file) {
 
 function isReadableSourceBlock(item) {
   const text = normalizeText(item.text);
+  if (item.kind === "table" || item.tableLike) return false;
   if (isLikelyHeaderBlock(item)) return false;
   if (countSentences(text) < 3) return false;
   if (countWords(text) < 40) return false;
