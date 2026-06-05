@@ -11,6 +11,14 @@ const FALLBACK_MODELS = [
   { id: "anthropic/claude-opus-4.7", name: "Premium - Claude Opus 4.7", prompt_price_per_mtok: 6, completion_price_per_mtok: 30 },
 ];
 
+const MIN_TEXT_CONTRAST = 4.5;
+const HEADER_COLOR_PALETTE = ["#2563eb", "#1d4ed8", "#1e40af", "#60a5fa", "#93c5fd", "#bfdbfe", "#172554", "#eff6ff"];
+const BULLET_COLOR_PALETTE = ["#9f1239", "#dc2626", "#b91c1c", "#f43f5e", "#fb7185", "#fca5a5", "#7f1d1d", "#fff1f2"];
+const DEBUG_SOURCE_REGION_OVERLAY = false;
+const DEBUG_SOURCE_SEGMENT_RECTS = false;
+const DEBUG_VISUAL_SAMPLING_BANDS = true;
+const DEBUG_VISUAL_SPAN_SAMPLE_BOXES = true;
+
 const state = {
   file: null,
   pdf: null,
@@ -169,6 +177,215 @@ function numericTokenRatio(text) {
   return numericTokens.length / tokens.length;
 }
 
+function isPageNumberText(text) {
+  return /^\d+[.)]?$/.test(text) || /^page\s+\d+$/i.test(text);
+}
+
+function isBoundaryLabelLine(line, medianFont = 12) {
+  const text = normalizeText(line.text);
+  if (!text) return true;
+  if (isPageNumberText(text)) return true;
+
+  const words = countWords(text);
+  const sentenceCount = countSentences(text);
+  if (words <= 10 && sentenceCount === 0 && /:$/.test(text)) return true;
+  if (isLikelyHeaderBlock(line, medianFont)) return true;
+  return false;
+}
+
+function isMostlyShortLabelLines(lines) {
+  if (!lines?.length) return true;
+  const shortLabelLines = lines.filter((line) => {
+    const text = normalizeText(line.text);
+    const words = countWords(text);
+    return words <= 8 && (countSentences(text) === 0 || isTitleCaseLike(text) || /:$/.test(text));
+  }).length;
+  const averageWordsPerLine = lines.reduce((total, line) => total + countWords(line.text), 0) / Math.max(1, lines.length);
+  return lines.length >= 3 && shortLabelLines / lines.length >= 0.55 && averageWordsPerLine <= 9;
+}
+
+function hasReasonableLineSpacing(lines, medianFont = 12) {
+  if (!lines || lines.length < 3) return true;
+  const ordered = [...lines].sort((a, b) => a.y - b.y || a.x - b.x);
+  const gaps = [];
+  for (let index = 1; index < ordered.length; index += 1) {
+    gaps.push(ordered[index].y - (ordered[index - 1].y + ordered[index - 1].height));
+  }
+  const positiveGaps = gaps.filter((gap) => gap > 0);
+  if (!positiveGaps.length) return true;
+  const largeGaps = positiveGaps.filter((gap) => gap > medianFont * 4.5);
+  return largeGaps.length / positiveGaps.length <= 0.25 && Math.max(...positiveGaps) <= medianFont * 12;
+}
+
+function getClampedSampleBox(ctx, rect, padding = 2) {
+  if (!ctx) return null;
+  const x = Math.max(0, Math.floor(rect.x - padding));
+  const y = Math.max(0, Math.floor(rect.y - padding));
+  const right = Math.min(ctx.canvas.width, Math.ceil(rect.x + rect.width + padding));
+  const bottom = Math.min(ctx.canvas.height, Math.ceil(rect.y + rect.height + padding));
+  const width = right - x;
+  const height = bottom - y;
+  if (width <= 0 || height <= 0) return null;
+  return { x, y, width, height };
+}
+
+function getUnionRect(rects) {
+  const cleanRects = rects.filter((rect) => (
+    rect
+    && Number.isFinite(rect.x)
+    && Number.isFinite(rect.y)
+    && Number.isFinite(rect.width)
+    && Number.isFinite(rect.height)
+    && rect.width > 0
+    && rect.height > 0
+  ));
+  if (!cleanRects.length) return null;
+
+  const x = Math.min(...cleanRects.map((rect) => rect.x));
+  const y = Math.min(...cleanRects.map((rect) => rect.y));
+  const right = Math.max(...cleanRects.map((rect) => rect.x + rect.width));
+  const bottom = Math.max(...cleanRects.map((rect) => rect.y + rect.height));
+  return {
+    x,
+    y,
+    width: right - x,
+    height: bottom - y,
+  };
+}
+
+function getDominantColor(colors) {
+  const buckets = new Map();
+  colors.filter(Boolean).forEach((color) => {
+    const key = [
+      Math.round(color.red / 12) * 12,
+      Math.round(color.green / 12) * 12,
+      Math.round(color.blue / 12) * 12,
+    ].join(",");
+    const bucket = buckets.get(key) || { count: 0, red: 0, green: 0, blue: 0 };
+    bucket.count += 1;
+    bucket.red += color.red;
+    bucket.green += color.green;
+    bucket.blue += color.blue;
+    buckets.set(key, bucket);
+  });
+  const dominant = [...buckets.values()].sort((a, b) => b.count - a.count)[0];
+  if (!dominant) return null;
+  return {
+    red: Math.round(dominant.red / dominant.count),
+    green: Math.round(dominant.green / dominant.count),
+    blue: Math.round(dominant.blue / dominant.count),
+  };
+}
+
+function getDominantValue(values) {
+  const counts = new Map();
+  values.filter(Boolean).forEach((value) => counts.set(value, (counts.get(value) || 0) + 1));
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || "";
+}
+
+function getDominantInkColorFromPixels(pixels, background) {
+  const buckets = new Map();
+  for (let index = 0; index < pixels.length; index += 4) {
+    if (pixels[index + 3] < 128) continue;
+
+    const color = {
+      red: pixels[index],
+      green: pixels[index + 1],
+      blue: pixels[index + 2],
+    };
+    if (getColorDistance(color, background) < 42) continue;
+    if (getContrastRatio(color, background) < 1.35) continue;
+
+    const key = [
+      Math.round(color.red / 12) * 12,
+      Math.round(color.green / 12) * 12,
+      Math.round(color.blue / 12) * 12,
+    ].join(",");
+    const bucket = buckets.get(key) || { count: 0, red: 0, green: 0, blue: 0 };
+    bucket.count += 1;
+    bucket.red += color.red;
+    bucket.green += color.green;
+    bucket.blue += color.blue;
+    buckets.set(key, bucket);
+  }
+
+  const dominant = [...buckets.values()].sort((a, b) => b.count - a.count)[0];
+  if (!dominant) return null;
+  return {
+    red: Math.round(dominant.red / dominant.count),
+    green: Math.round(dominant.green / dominant.count),
+    blue: Math.round(dominant.blue / dominant.count),
+  };
+}
+
+function sampleTextVisualStyle(ctx, rect) {
+  const sampleBox = getClampedSampleBox(ctx, rect, 2);
+  if (!sampleBox) return { backgroundColor: null, textColor: null, sampleBox: null };
+
+  try {
+    const pixels = ctx.getImageData(sampleBox.x, sampleBox.y, sampleBox.width, sampleBox.height).data;
+    const backgroundColor = getDominantBackgroundColorFromPixels(pixels);
+    return {
+      backgroundColor,
+      textColor: getDominantInkColorFromPixels(pixels, backgroundColor),
+      sampleBox,
+    };
+  } catch (_) {
+    return { backgroundColor: null, textColor: null, sampleBox: null };
+  }
+}
+
+function getLineVisualReference(lines) {
+  return {
+    backgroundColor: getDominantColor(lines.map((line) => line.backgroundColor)),
+    textColor: getDominantColor(lines.map((line) => line.textColor)),
+    fontFamily: getDominantValue(lines.map((line) => line.fontFamily)),
+    fontStyle: getDominantValue(lines.map((line) => line.fontStyle)),
+    fontSize: median(lines.map((line) => line.fontSize)),
+    fontWeight: median(lines.map((line) => line.fontWeight)),
+  };
+}
+
+function hasMeaningfulBackgroundChange(line, reference) {
+  if (!line.backgroundColor || !reference?.backgroundColor) return false;
+  const distance = getColorDistance(line.backgroundColor, reference.backgroundColor);
+  const brightnessA = (line.backgroundColor.red + line.backgroundColor.green + line.backgroundColor.blue) / 3;
+  const brightnessB = (reference.backgroundColor.red + reference.backgroundColor.green + reference.backgroundColor.blue) / 3;
+  return distance >= 28 && Math.abs(brightnessA - brightnessB) >= 10;
+}
+
+function hasMeaningfulTextColorChange(line, reference) {
+  if (!line.textColor || !reference?.textColor) return false;
+  return getColorDistance(line.textColor, reference.textColor) >= 72;
+}
+
+function hasMeaningfulFontChange(line, reference, medianFont = 12) {
+  if (!reference) return false;
+  const fontSizeChanged = reference.fontSize
+    && Math.abs(line.fontSize - reference.fontSize) >= Math.max(2, medianFont * 0.16);
+  const fontWeightChanged = Math.abs((line.fontWeight || 400) - (reference.fontWeight || 400)) >= 250;
+  const fontFamilyChanged = reference.fontFamily && line.fontFamily && line.fontFamily !== reference.fontFamily;
+  const fontStyleChanged = reference.fontStyle && line.fontStyle && line.fontStyle !== reference.fontStyle;
+  return fontSizeChanged || fontWeightChanged || fontFamilyChanged || fontStyleChanged;
+}
+
+function isLineVisualOutlier(line, pageVisualReference, medianFont = 12) {
+  if (hasMeaningfulBackgroundChange(line, pageVisualReference)) return true;
+  const words = countWords(line.text);
+  if (words <= 16 && hasMeaningfulTextColorChange(line, pageVisualReference)) return true;
+  if (words <= 16 && hasMeaningfulFontChange(line, pageVisualReference, medianFont)) return true;
+  return false;
+}
+
+function isLineVisualBoundary(line, current, medianFont = 12) {
+  if (!current?.lines?.length) return false;
+  const currentReference = getLineVisualReference(current.lines);
+  if (hasMeaningfulBackgroundChange(line, currentReference)) return true;
+  if (hasMeaningfulTextColorChange(line, currentReference)) return true;
+  if (hasMeaningfulFontChange(line, currentReference, medianFont)) return true;
+  return false;
+}
+
 function splitLineSpansIntoRuns(orderedSpans, medianFont, pageWidth) {
   const runs = [];
   let currentRun = [];
@@ -220,6 +437,13 @@ function buildLineFromSpans(ordered, id, tableLike, rowRunCount) {
     height: bottom - y,
     fontSize: median(ordered.map((span) => span.fontSize)),
     fontWeight: median(ordered.map((span) => span.fontWeight)),
+    fontFamily: getDominantValue(ordered.map((span) => span.fontFamily)),
+    fontName: getDominantValue(ordered.map((span) => span.fontName)),
+    fontStyle: getDominantValue(ordered.map((span) => span.fontStyle)),
+    backgroundColor: getDominantColor(ordered.map((span) => span.backgroundColor)),
+    textColor: getDominantColor(ordered.map((span) => span.textColor)),
+    sampleBox: getUnionRect(ordered.map((span) => span.sampleBox)),
+    sampleBoxes: ordered.map((span) => span.sampleBox).filter(Boolean),
     textLength: text.length,
     tableLike,
     rowRunCount,
@@ -235,6 +459,9 @@ function buildLineFromSpans(ordered, id, tableLike, rowRunCount) {
       fontName: span.fontName,
       fontStyle: span.fontStyle,
       fontWeight: span.fontWeight,
+      backgroundColor: span.backgroundColor,
+      textColor: span.textColor,
+      sampleBox: span.sampleBox,
       text: span.text,
       textLength: span.textLength,
     })),
@@ -409,7 +636,7 @@ function median(values) {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
-function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
+function extractBlocksFromTextContent(textContent, viewport, pageNumber, analysisContext = null) {
   const spans = textContent.items
     .map((item, index) => {
       const text = normalizeText(item.str || "");
@@ -418,20 +645,28 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
       const x = textMatrix[4];
       const baselineY = textMatrix[5];
       const fontSize = Math.max(8, Math.hypot(textMatrix[2], textMatrix[3]) || getFontSize(item) * viewport.scale);
-      const width = Math.max((item.width || 0) * viewport.scale, text.length * fontSize * 0.42, 8);
+      const pdfWidth = (item.width || 0) * viewport.scale;
+      const estimatedWidth = text.length * fontSize * 0.42;
+      const width = Math.max(pdfWidth || estimatedWidth, 8);
+      const y = baselineY - fontSize;
+      const height = fontSize * 1.35;
+      const visualStyle = sampleTextVisualStyle(analysisContext, { x, y, width, height });
       return {
         id: `p${pageNumber}-s${index}`,
         text,
         x,
-        y: baselineY - fontSize,
+        y,
         baselineY,
         width,
-        height: fontSize * 1.35,
+        height,
         fontSize,
         fontFamily: getFontFamily(item.fontName, textContent),
         fontName: item.fontName || "",
         fontStyle: getFontStyle(item.fontName),
         fontWeight: getFontWeight(item.fontName),
+        backgroundColor: visualStyle.backgroundColor,
+        textColor: visualStyle.textColor,
+        sampleBox: visualStyle.sampleBox,
         textLength: text.length,
       };
     })
@@ -474,6 +709,13 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
       height: line.height,
       fontSize: line.fontSize,
       fontWeight: line.fontWeight,
+      fontFamily: line.fontFamily,
+      fontName: line.fontName,
+      fontStyle: line.fontStyle,
+      backgroundColor: line.backgroundColor,
+      textColor: line.textColor,
+      sampleBox: line.sampleBox,
+      sampleBoxes: line.sampleBoxes || [],
       text: line.text,
       textLength: line.textLength,
       tableLike: Boolean(line.tableLike),
@@ -488,7 +730,49 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
     current = null;
   };
 
+  const pageVisualReference = getLineVisualReference(lines.filter((line) => !line.tableLike));
+  const visualDebugLines = [];
+  const addVisualDebugLine = (line, status, details = {}) => {
+    visualDebugLines.push({
+      id: line.id,
+      status,
+      text: line.text,
+      x: line.x,
+      y: line.y,
+      width: line.width,
+      height: line.height,
+      sampleBox: line.sampleBox,
+      sampleBoxes: line.sampleBoxes || [],
+      backgroundColor: line.backgroundColor,
+      textColor: line.textColor,
+      fontSize: line.fontSize,
+      fontWeight: line.fontWeight,
+      tableLike: Boolean(line.tableLike),
+      ...details,
+    });
+  };
+
   lines.forEach((line) => {
+    const boundaryLabel = isBoundaryLabelLine(line, medianFont);
+    const visualOutlier = isLineVisualOutlier(line, pageVisualReference, medianFont);
+
+    if (line.tableLike || boundaryLabel || visualOutlier) {
+      addVisualDebugLine(line, line.tableLike ? "table" : boundaryLabel ? "boundary-label" : "visual-outlier", {
+        boundaryLabel,
+        visualOutlier,
+      });
+      flush();
+      return;
+    }
+
+    const visualBoundary = isLineVisualBoundary(line, current, medianFont);
+    if (visualBoundary) {
+      addVisualDebugLine(line, "visual-boundary", { visualBoundary });
+      flush();
+    } else {
+      addVisualDebugLine(line, "kept");
+    }
+
     const lastLine = current?.lines[current.lines.length - 1];
     const gap = lastLine ? line.y - (lastLine.y + lastLine.height) : 999;
     const sameColumn = isSameTextColumn(current, line, medianFont);
@@ -537,7 +821,23 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber) {
       textLength: block.text.length,
     })),
     textSpans: spans,
+    debugLines: visualDebugLines,
   };
+}
+
+async function renderPageAnalysisContext(page, viewport) {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true }) || canvas.getContext("2d");
+  if (!ctx) return null;
+
+  try {
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    return ctx;
+  } catch (_) {
+    return null;
+  }
 }
 
 async function parsePdf(file) {
@@ -552,13 +852,15 @@ async function parsePdf(file) {
     const page = await pdf.getPage(pageNumber);
     const viewport = page.getViewport({ scale: 1.35 });
     const textContent = await page.getTextContent();
-    const pageText = extractBlocksFromTextContent(textContent, viewport, pageNumber);
+    const analysisContext = await renderPageAnalysisContext(page, viewport);
+    const pageText = extractBlocksFromTextContent(textContent, viewport, pageNumber, analysisContext);
     state.pages.push({
       pageNumber,
       width: viewport.width,
       height: viewport.height,
       items: pageText.items,
       textSpans: pageText.textSpans,
+      debugLines: pageText.debugLines || [],
     });
   }
 }
@@ -593,12 +895,16 @@ async function uploadPdf(file) {
 
 function isReadableSourceBlock(item) {
   const text = normalizeText(item.text);
+  const lines = item.lineBoxes || [];
+  const medianFont = Math.max(8, item.fontSize || median(lines.map((line) => line.fontSize)));
   if (item.kind === "table" || item.tableLike) return false;
   if (isLikelyHeaderBlock(item)) return false;
   if (countSentences(text) < 3) return false;
   if (countWords(text) < 40) return false;
-  if (/^\d+[.)]?$/.test(text)) return false;
-  if (/^page\s+\d+$/i.test(text)) return false;
+  if (isPageNumberText(text)) return false;
+  if (numericTokenRatio(text) > 0.45) return false;
+  if (isMostlyShortLabelLines(lines)) return false;
+  if (!hasReasonableLineSpacing(lines, medianFont)) return false;
   return ["paragraph", "text", "bullet"].includes(item.kind) || countSentences(text) > 0;
 }
 
@@ -669,13 +975,14 @@ function getFirstSourceItem(ids, fallbackText = "") {
   return matchedIds.length ? sourceById.get(matchedIds[0]) : null;
 }
 
-function annotationFromPlan(item, kind, label, originalText, index, sourceItemIds = [item.id]) {
+function annotationFromPlan(item, kind, label, originalText, index, sourceItemIds = [item.id], metadata = {}) {
   const lineHeight = Math.max(20, item.fontSize * 1.55);
   const x = kind === "bullet" ? item.x + Math.max(12, item.fontSize) : item.x;
   return {
     pageNumber: item.pageNumber,
     sourceItemIds: coerceIdList(sourceItemIds).length ? coerceIdList(sourceItemIds) : [item.id],
     anchorItemId: item.id,
+    sectionId: metadata.sectionId || null,
     kind,
     label: normalizeText(label).slice(0, 90),
     originalText: kind === "bullet" ? normalizeText(originalText || item.text) : "",
@@ -696,12 +1003,13 @@ function annotationsFromStructuredSummary(data) {
   };
 
   (data.articles || []).forEach((article) => {
-    (article.sections || []).forEach((section) => {
+    (article.sections || []).forEach((section, sectionIndex) => {
+      const sectionId = String(section.sectionId || section.id || `${article.articleId}-s${sectionIndex + 1}`);
       const sectionBlocks = section.blocks || [];
       const firstBlock = sectionBlocks.find((block) => coerceIdList(block.sourceBlockIds).length || block.sourceText);
       const headerItem = getFirstSourceItem(section.sourceBlockIds, section.sourceText) || getFirstSourceItem(firstBlock?.sourceBlockIds, firstBlock?.sourceText);
       if (headerItem && section.title) {
-        annotations.push(annotationFromPlan(headerItem, "header", section.title, "", nextRow(headerItem.id)));
+        annotations.push(annotationFromPlan(headerItem, "header", section.title, "", nextRow(headerItem.id), [headerItem.id], { sectionId }));
       }
 
       sectionBlocks.forEach((block) => {
@@ -709,7 +1017,7 @@ function annotationsFromStructuredSummary(data) {
         const matchedIds = sourceIds.length ? sourceIds : findSourceIdsForText(block.sourceText, coerceIdList(section.sourceBlockIds));
         const item = getFirstSourceItem(matchedIds, block.sourceText);
         if (!item || !block.bullet) return;
-        annotations.push(annotationFromPlan(item, "bullet", block.bullet, block.sourceText || item.text, nextRow(item.id), matchedIds.length ? matchedIds : [item.id]));
+        annotations.push(annotationFromPlan(item, "bullet", block.bullet, block.sourceText || item.text, nextRow(item.id), matchedIds.length ? matchedIds : [item.id], { sectionId }));
       });
     });
   });
@@ -818,47 +1126,324 @@ function getTextSpanWidth(ctx, span) {
   return Math.max(span.width || 0, measuredWidth, estimatedWidth, 4);
 }
 
-function shouldEraseRenderedSpan(ctx, x, y, width, height) {
-  const sampleWidth = Math.max(1, Math.floor(width));
-  const sampleHeight = Math.max(1, Math.floor(height));
-  if (sampleWidth <= 0 || sampleHeight <= 0) return false;
+function colorToCss(color) {
+  return `rgb(${color.red}, ${color.green}, ${color.blue})`;
+}
+
+function parseHexColor(hex) {
+  const normalized = String(hex || "").replace("#", "");
+  const value = normalized.length === 3
+    ? normalized.split("").map((char) => char + char).join("")
+    : normalized.padEnd(6, "0").slice(0, 6);
+  return {
+    red: parseInt(value.slice(0, 2), 16),
+    green: parseInt(value.slice(2, 4), 16),
+    blue: parseInt(value.slice(4, 6), 16),
+  };
+}
+
+function getRelativeLuminance(color) {
+  const channel = (value) => {
+    const normalized = value / 255;
+    return normalized <= 0.03928 ? normalized / 12.92 : ((normalized + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel(color.red) + 0.7152 * channel(color.green) + 0.0722 * channel(color.blue);
+}
+
+function getContrastRatio(colorA, colorB) {
+  const luminanceA = getRelativeLuminance(colorA);
+  const luminanceB = getRelativeLuminance(colorB);
+  const lighter = Math.max(luminanceA, luminanceB);
+  const darker = Math.min(luminanceA, luminanceB);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+function getColorDistance(colorA, colorB) {
+  return Math.hypot(colorA.red - colorB.red, colorA.green - colorB.green, colorA.blue - colorB.blue);
+}
+
+function pickReadableColor(background, palette, avoidHex = null) {
+  const avoidColor = avoidHex ? parseHexColor(avoidHex) : null;
+  const scored = palette.map((hex, index) => {
+    const color = parseHexColor(hex);
+    const contrast = getContrastRatio(color, background);
+    const distanceFromAvoid = avoidColor ? getColorDistance(color, avoidColor) : 120;
+    return {
+      hex,
+      contrast,
+      distanceFromAvoid,
+      score: contrast * 12 + Math.min(distanceFromAvoid, 180) / 18 - index * 0.35,
+    };
+  });
+
+  const preferred = scored.find((candidate) => (
+    candidate.contrast >= MIN_TEXT_CONTRAST
+    && (!avoidColor || candidate.distanceFromAvoid >= 72)
+  ));
+  if (preferred) return preferred.hex;
+  return scored.sort((a, b) => b.score - a.score)[0]?.hex || palette[0];
+}
+
+function getReplacementColors(background) {
+  const header = pickReadableColor(background, HEADER_COLOR_PALETTE);
+  const bullet = pickReadableColor(background, BULLET_COLOR_PALETTE, header);
+  return { header, bullet };
+}
+
+function getDominantBackgroundColorFromPixels(pixels) {
+  const buckets = new Map();
+  for (let index = 0; index < pixels.length; index += 4) {
+    const alpha = pixels[index + 3];
+    if (alpha < 128) continue;
+
+    const red = pixels[index];
+    const green = pixels[index + 1];
+    const blue = pixels[index + 2];
+
+    const key = [
+      Math.round(red / 10) * 10,
+      Math.round(green / 10) * 10,
+      Math.round(blue / 10) * 10,
+    ].join(",");
+    const bucket = buckets.get(key) || { count: 0, red: 0, green: 0, blue: 0 };
+    bucket.count += 1;
+    bucket.red += red;
+    bucket.green += green;
+    bucket.blue += blue;
+    buckets.set(key, bucket);
+  }
+
+  const dominant = [...buckets.values()].sort((a, b) => b.count - a.count)[0];
+  if (!dominant) return { red: 255, green: 255, blue: 255 };
+  return {
+    red: Math.round(dominant.red / dominant.count),
+    green: Math.round(dominant.green / dominant.count),
+    blue: Math.round(dominant.blue / dominant.count),
+  };
+}
+
+function getSourceSegmentRects(ctx, pageData, source) {
+  const spanById = new Map((pageData.textSpans || []).map((span) => [span.id, span]));
+  const sourceSpanIds = getSourceSpanIds(source);
+  const spans = sourceSpanIds.map((spanId) => spanById.get(spanId)).filter(Boolean);
+  if (spans.length) {
+    return spans.map((span) => ({
+      x: span.x,
+      y: span.y,
+      width: Math.max(span.width || 0, 4),
+      height: Math.max(span.height || 0, Math.max(8, span.fontSize || 12) * 1.25),
+      fontSize: span.fontSize,
+    }));
+  }
+
+  const lineSegments = getSourceLines(source).flatMap((line) => line.segments || []);
+  if (lineSegments.length) {
+    return lineSegments.map((segment) => ({
+      x: segment.x,
+      y: segment.y,
+      width: Math.max(segment.width || 0, (segment.textLength || (segment.text || "").length) * Math.max(8, segment.fontSize || 12) * 0.48, 4),
+      height: Math.max(segment.height || 0, Math.max(8, segment.fontSize || 12) * 1.25),
+      fontSize: segment.fontSize,
+    }));
+  }
+
+  const lines = getSourceLines(source);
+  if (lines.length) {
+    return lines.map((line) => ({
+      x: line.x,
+      y: line.y,
+      width: Math.max(line.width || 0, getLineTextWidth(ctx, line), 4),
+      height: Math.max(line.height || 0, Math.max(8, line.fontSize || source.fontSize || 12) * 1.25),
+      fontSize: line.fontSize || source.fontSize,
+    }));
+  }
+
+  return [{
+    x: source.x,
+    y: source.y,
+    width: Math.max(source.width || 0, 4),
+    height: Math.max(source.height || 0, Math.max(8, source.fontSize || 12) * 1.25),
+    fontSize: source.fontSize,
+  }];
+}
+
+function clampRectToPage(rect, pageData) {
+  const x = Math.max(0, Math.min(pageData.width, rect.x));
+  const y = Math.max(0, Math.min(pageData.height, rect.y));
+  const right = Math.max(x, Math.min(pageData.width, rect.x + rect.width));
+  const bottom = Math.max(y, Math.min(pageData.height, rect.y + rect.height));
+  return {
+    x,
+    y,
+    width: Math.max(1, right - x),
+    height: Math.max(1, bottom - y),
+  };
+}
+
+function sampleRegionBackground(ctx, region) {
+  const sampleX = Math.max(0, Math.floor(region.x));
+  const sampleY = Math.max(0, Math.floor(region.y));
+  const sampleWidth = Math.min(ctx.canvas.width - sampleX, Math.max(1, Math.ceil(region.width)));
+  const sampleHeight = Math.min(ctx.canvas.height - sampleY, Math.max(1, Math.ceil(region.height)));
+  if (sampleWidth <= 0 || sampleHeight <= 0) return { red: 255, green: 255, blue: 255 };
 
   try {
-    const pixels = ctx.getImageData(x, y, sampleWidth, sampleHeight).data;
-    let nonWhitePixels = 0;
-    const totalPixels = pixels.length / 4;
-    for (let index = 0; index < pixels.length; index += 4) {
-      const red = pixels[index];
-      const green = pixels[index + 1];
-      const blue = pixels[index + 2];
-      if (red < 245 || green < 245 || blue < 245) nonWhitePixels += 1;
-    }
-
-    return nonWhitePixels / Math.max(1, totalPixels) < 0.35;
+    return getDominantBackgroundColorFromPixels(ctx.getImageData(sampleX, sampleY, sampleWidth, sampleHeight).data);
   } catch (_) {
-    return true;
+    return { red: 255, green: 255, blue: 255 };
   }
 }
 
-function eraseTextSpans(ctx, pageData, spanIds = null) {
-  if (!pageData.textSpans?.length) return;
+function getSourceRegion(ctx, pageData, source) {
+  const rects = getSourceSegmentRects(ctx, pageData, source);
+  const debugRects = rects.map((rect) => clampRectToPage(rect, pageData));
+  const fontSize = Math.max(8, median(rects.map((rect) => rect.fontSize || rect.height || source.fontSize || 12)));
+  const padX = Math.max(2, fontSize * 0.16);
+  const padTop = Math.max(2, fontSize * 0.2);
+  const padBottom = Math.max(3, fontSize * 0.32);
+  const rawRegion = {
+    x: Math.min(...rects.map((rect) => rect.x)) - padX,
+    y: Math.min(...rects.map((rect) => rect.y)) - padTop,
+    width: Math.max(...rects.map((rect) => rect.x + rect.width)) - Math.min(...rects.map((rect) => rect.x)) + padX * 2,
+    height: Math.max(...rects.map((rect) => rect.y + rect.height)) - Math.min(...rects.map((rect) => rect.y)) + padTop + padBottom,
+  };
+  const region = clampRectToPage(rawRegion, pageData);
+  const background = sampleRegionBackground(ctx, region);
+  return {
+    ...region,
+    id: source.id,
+    background,
+    colors: getReplacementColors(background),
+    debugRects,
+  };
+}
+
+function clearSourceRegion(ctx, region) {
+  ctx.save();
+  if (DEBUG_SOURCE_REGION_OVERLAY) {
+    ctx.fillStyle = "rgba(250, 204, 21, 0.42)";
+    ctx.strokeStyle = "#ca8a04";
+    ctx.lineWidth = 2;
+    ctx.fillRect(region.x, region.y, region.width, region.height);
+    ctx.strokeRect(region.x, region.y, region.width, region.height);
+    if (DEBUG_SOURCE_SEGMENT_RECTS && region.debugRects?.length) {
+      const maxRight = Math.max(...region.debugRects.map((rect) => rect.x + rect.width));
+      const maxBottom = Math.max(...region.debugRects.map((rect) => rect.y + rect.height));
+      region.debugRects.forEach((rect) => {
+        const drivesRight = Math.abs(rect.x + rect.width - maxRight) <= 0.75;
+        const drivesBottom = Math.abs(rect.y + rect.height - maxBottom) <= 0.75;
+        ctx.fillStyle = drivesRight || drivesBottom ? "rgba(236, 72, 153, 0.16)" : "rgba(239, 68, 68, 0.08)";
+        ctx.strokeStyle = drivesBottom ? "#db2777" : drivesRight ? "#16a34a" : "#dc2626";
+        ctx.lineWidth = drivesRight || drivesBottom ? 2 : 1;
+        ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+        ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+      });
+    }
+    ctx.restore();
+    return;
+  }
+  ctx.fillStyle = colorToCss(region.background);
+  ctx.fillRect(region.x, region.y, region.width, region.height);
+  ctx.restore();
+}
+
+function clearReplacementRegions(ctx, annotations) {
+  const cleared = new Set();
+  annotations.forEach((annotation) => {
+    const region = annotation.sourceRegion;
+    if (!region || cleared.has(region.id)) return;
+    cleared.add(region.id);
+    clearSourceRegion(ctx, region);
+  });
+}
+
+function getVisualDebugStyle(status) {
+  const styles = {
+    kept: { stroke: "#16a34a", fill: "rgba(34, 197, 94, 0.12)" },
+    table: { stroke: "#64748b", fill: "rgba(100, 116, 139, 0.10)" },
+    "boundary-label": { stroke: "#f59e0b", fill: "rgba(245, 158, 11, 0.14)" },
+    "visual-outlier": { stroke: "#db2777", fill: "rgba(219, 39, 119, 0.14)" },
+    "visual-boundary": { stroke: "#7c3aed", fill: "rgba(124, 58, 237, 0.14)" },
+  };
+  return styles[status] || { stroke: "#2563eb", fill: "rgba(37, 99, 235, 0.12)" };
+}
+
+function colorWithAlpha(color, alpha) {
+  if (!color) return `rgba(255, 255, 255, ${alpha})`;
+  return `rgba(${color.red}, ${color.green}, ${color.blue}, ${alpha})`;
+}
+
+function drawDebugRect(ctx, rect, pageData, fillStyle, strokeStyle, lineWidth = 1, dash = []) {
+  if (!rect) return;
+  const clamped = clampRectToPage(rect, pageData);
+  ctx.save();
+  ctx.setLineDash(dash);
+  ctx.fillStyle = fillStyle;
+  ctx.strokeStyle = strokeStyle;
+  ctx.lineWidth = lineWidth;
+  ctx.fillRect(clamped.x, clamped.y, clamped.width, clamped.height);
+  ctx.strokeRect(clamped.x, clamped.y, clamped.width, clamped.height);
+  ctx.restore();
+}
+
+function drawVisualDebugLegend(ctx) {
+  const entries = [
+    ["kept", "kept"],
+    ["boundary-label", "label/header"],
+    ["visual-outlier", "visual outlier"],
+    ["visual-boundary", "new visual block"],
+    ["table", "table"],
+  ];
+  const x = 14;
+  const y = 14;
+  const rowHeight = 16;
 
   ctx.save();
-  ctx.fillStyle = "#ffffff";
-  pageData.textSpans.forEach((span) => {
-    if (spanIds && !spanIds.has(span.id)) return;
+  ctx.font = "10px Inter, Arial, sans-serif";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(255, 255, 255, 0.82)";
+  ctx.strokeStyle = "rgba(15, 23, 42, 0.2)";
+  ctx.lineWidth = 1;
+  ctx.fillRect(x - 8, y - 8, 138, entries.length * rowHeight + 12);
+  ctx.strokeRect(x - 8, y - 8, 138, entries.length * rowHeight + 12);
 
-    const fontSize = Math.max(8, span.fontSize || 12);
-    const padX = Math.max(2, fontSize * 0.18);
-    const padTop = Math.max(2, fontSize * 0.25);
-    const padBottom = Math.max(3, fontSize * 0.32);
-    const x = Math.max(0, span.x - padX);
-    const y = Math.max(0, span.y - padTop);
-    const right = Math.min(pageData.width, span.x + getTextSpanWidth(ctx, span) + padX);
-    const bottom = Math.min(pageData.height, span.y + Math.max(span.height, fontSize * 1.35) + padBottom);
-    if (!shouldEraseRenderedSpan(ctx, x, y, right - x, bottom - y)) return;
-    ctx.fillRect(x, y, right - x, bottom - y);
+  entries.forEach(([status, label], index) => {
+    const style = getVisualDebugStyle(status);
+    const rowY = y + index * rowHeight;
+    ctx.fillStyle = style.fill;
+    ctx.strokeStyle = style.stroke;
+    ctx.fillRect(x, rowY - 5, 10, 10);
+    ctx.strokeRect(x, rowY - 5, 10, 10);
+    ctx.fillStyle = "#0f172a";
+    ctx.fillText(label, x + 16, rowY);
   });
+  ctx.restore();
+}
+
+function drawVisualSamplingDebug(ctx, pageData) {
+  if (!DEBUG_VISUAL_SAMPLING_BANDS || !pageData.debugLines?.length) return;
+
+  ctx.save();
+  pageData.debugLines.forEach((line) => {
+    const style = getVisualDebugStyle(line.status);
+    const sampleBand = line.sampleBox || {
+      x: line.x,
+      y: line.y,
+      width: line.width,
+      height: line.height,
+    };
+    const dash = line.status === "kept" ? [] : [4, 3];
+
+    drawDebugRect(ctx, sampleBand, pageData, colorWithAlpha(line.backgroundColor, 0.2), style.stroke, 1.5, dash);
+    drawDebugRect(ctx, line, pageData, style.fill, "rgba(15, 23, 42, 0.45)", 0.75, [2, 3]);
+
+    if (DEBUG_VISUAL_SPAN_SAMPLE_BOXES && line.sampleBoxes?.length) {
+      line.sampleBoxes.forEach((sampleBox) => {
+        drawDebugRect(ctx, sampleBox, pageData, "rgba(6, 182, 212, 0.08)", "rgba(8, 145, 178, 0.9)", 0.75);
+      });
+    }
+  });
+  drawVisualDebugLegend(ctx);
   ctx.restore();
 }
 
@@ -886,6 +1471,30 @@ function getFixedLengthReplacement(annotation, sourceText) {
   const label = normalizeText(getCanvasLabel(annotation));
   const sourceLength = Math.max(label.length, sourceText?.length || 0);
   return label.padEnd(sourceLength, " ");
+}
+
+function getLayoutMeasureContext() {
+  if (!getLayoutMeasureContext.ctx) {
+    const canvas = document.createElement("canvas");
+    getLayoutMeasureContext.ctx = canvas.getContext("2d");
+  }
+  return getLayoutMeasureContext.ctx;
+}
+
+function getAnnotationLabelWidth(annotation, fontSize) {
+  const ctx = getLayoutMeasureContext();
+  if (!ctx) return getCanvasLabel(annotation).length * fontSize * 0.58;
+  ctx.font = `650 ${fontSize}px Inter, Arial, sans-serif`;
+  return ctx.measureText(getCanvasLabel(annotation)).width;
+}
+
+function canShareBulletRow(first, second, slotWidth, fontSize) {
+  if (!first || !second) return false;
+  if (first.kind !== "bullet" || second.kind !== "bullet") return false;
+  if (!first.sectionId || first.sectionId !== second.sectionId) return false;
+  const maxLabelWidth = Math.max(24, slotWidth - 8);
+  return getAnnotationLabelWidth(first, fontSize) <= maxLabelWidth
+    && getAnnotationLabelWidth(second, fontSize) <= maxLabelWidth;
 }
 
 function getLineTextWidth(ctx, line) {
@@ -919,7 +1528,7 @@ function eraseSourceText(ctx, source, pageData) {
   ctx.restore();
 }
 
-function layoutReplacementAnnotations(pageData, pageAnnotations) {
+function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
   const replacements = getSourceReplacements(pageData, pageAnnotations);
   const positioned = [];
   const replacedAnnotations = new Set();
@@ -929,35 +1538,83 @@ function layoutReplacementAnnotations(pageData, pageAnnotations) {
     const orderedAnnotations = [...annotations].sort((a, b) => a.y - b.y || a.x - b.x);
     const lineHeight = median(lines.map((line) => line.height));
     const fontSize = Math.max(11, source.fontSize || median(lines.map((line) => line.fontSize)));
-    const annotationLineHeight = Math.max(24, lineHeight, fontSize * 1.9);
+    const sourceRegion = ctx ? getSourceRegion(ctx, pageData, source) : {
+      id: source.id,
+      x: source.x,
+      y: source.y,
+      width: source.width,
+      height: source.height,
+      background: { red: 255, green: 255, blue: 255 },
+      colors: getReplacementColors({ red: 255, green: 255, blue: 255 }),
+    };
+    const regionPadding = Math.max(2, fontSize * 0.22);
+    const regionLeft = sourceRegion.x + regionPadding;
+    const regionRight = sourceRegion.x + sourceRegion.width - regionPadding;
+    const regionTop = sourceRegion.y + regionPadding;
+    const regionHeight = Math.max(12, sourceRegion.height - regionPadding * 2);
+    const baseAnnotationLineHeight = Math.max(22, lineHeight, fontSize * 1.65);
+    const baseBulletFontSize = Math.max(12, fontSize * 0.96);
+    const baseHeaderFontSize = Math.max(14, fontSize * 1.08);
+    const replacementRows = [];
 
-    orderedAnnotations.forEach((annotation, index) => {
-      replacedAnnotations.add(annotation);
-      const line = lines[index] || {
-        x: source.x,
-        y: source.y + index * annotationLineHeight,
+    for (let index = 0; index < orderedAnnotations.length; index += 1) {
+      const annotation = orderedAnnotations[index];
+      const nextAnnotation = orderedAnnotations[index + 1];
+      const bulletFontSize = baseBulletFontSize;
+      const textAreaWidth = Math.max(24, regionRight - regionLeft);
+      const halfSlotWidth = Math.max(24, textAreaWidth / 2 - Math.max(10, fontSize * 0.9) - 8);
+      if (canShareBulletRow(annotation, nextAnnotation, halfSlotWidth, bulletFontSize)) {
+        replacementRows.push([annotation, nextAnnotation]);
+        index += 1;
+      } else {
+        replacementRows.push([annotation]);
+      }
+    }
+
+    const rowHeight = Math.max(
+      11,
+      Math.min(baseAnnotationLineHeight, regionHeight / Math.max(1, replacementRows.length)),
+    );
+
+    replacementRows.forEach((row, rowIndex) => {
+      const line = lines[rowIndex] || {
+        x: regionLeft,
+        y: regionTop + rowIndex * rowHeight,
         width: source.width,
-        height: annotationLineHeight,
+        height: rowHeight,
         fontSize,
         text: "",
         textLength: 0,
       };
-      const y = Math.max(line.y, source.y + index * annotationLineHeight);
-      const indent = annotation.kind === "bullet" ? Math.max(10, fontSize * 0.9) : 0;
-      const rightEdge = Math.min(pageData.width, source.x + source.width);
-      const maxAvailableWidth = Math.max(24, pageData.width - (line.x + indent) - 8);
-      const availableWidth = Math.min(
-        maxAvailableWidth,
-        Math.max(line.width - indent, rightEdge - (line.x + indent), source.width - indent, 220),
-      );
-      positioned.push({
-        ...annotation,
-        x: line.x + indent,
-        y,
-        width: Math.max(24, availableWidth),
-        height: Math.max(22, annotationLineHeight),
-        fontSize: annotation.kind === "header" ? Math.max(14, fontSize * 1.08) : Math.max(12, fontSize * 0.96),
-        replacementText: getFixedLengthReplacement(annotation, line.text || source.text),
+      const y = regionTop + rowIndex * rowHeight;
+      const rightEdge = Math.max(regionLeft + 24, regionRight);
+
+      row.forEach((annotation, rowItemIndex) => {
+        replacedAnnotations.add(annotation);
+        const isPairedBullet = row.length === 2 && annotation.kind === "bullet";
+        const fittedFontSize = annotation.kind === "header"
+          ? Math.max(9, Math.min(baseHeaderFontSize, rowHeight * 0.72))
+          : Math.max(8, Math.min(baseBulletFontSize, rowHeight * 0.64));
+        const indent = annotation.kind === "bullet" ? Math.max(8, fittedFontSize * 0.85) : 0;
+        const lineX = Math.max(regionLeft, Math.min(line.x || regionLeft, rightEdge - 24));
+        const rowX = Math.max(regionLeft, Math.min(lineX + indent, rightEdge - 24));
+        const centerX = regionLeft + Math.max(24, rightEdge - regionLeft) / 2;
+        const x = isPairedBullet && rowItemIndex === 1 ? Math.max(centerX, rowX) : rowX;
+        const maxAvailableWidth = Math.max(24, rightEdge - x);
+        const availableWidth = isPairedBullet
+          ? Math.max(24, Math.min(maxAvailableWidth, (rowItemIndex === 0 ? centerX : rightEdge) - x - 8))
+          : maxAvailableWidth;
+        positioned.push({
+          ...annotation,
+          x,
+          y,
+          width: Math.max(24, availableWidth),
+          height: Math.max(10, rowHeight),
+          fontSize: fittedFontSize,
+          replacementText: getFixedLengthReplacement(annotation, line.text || source.text),
+          sourceRegion,
+          textColor: annotation.kind === "header" ? sourceRegion.colors.header : sourceRegion.colors.bullet,
+        });
       });
     });
   });
@@ -979,18 +1636,28 @@ function drawReplacementText(ctx, annotation) {
   const label = (annotation.replacementText || getCanvasLabel(annotation)).trimEnd();
   let fontSize = annotation.fontSize || (annotation.kind === "header" ? 15 : 13);
   const weight = annotation.kind === "header" ? 800 : 650;
-  const color = annotation.kind === "header" ? "#2563eb" : "#9f1239";
+  const color = annotation.textColor || (annotation.kind === "header" ? HEADER_COLOR_PALETTE[0] : BULLET_COLOR_PALETTE[0]);
 
   ctx.save();
+  if (annotation.sourceRegion) {
+    ctx.beginPath();
+    ctx.rect(
+      annotation.sourceRegion.x,
+      annotation.sourceRegion.y,
+      annotation.sourceRegion.width,
+      annotation.sourceRegion.height,
+    );
+    ctx.clip();
+  }
   ctx.fillStyle = color;
   ctx.font = `${weight} ${fontSize}px Inter, Arial, sans-serif`;
-  while (fontSize > 9 && ctx.measureText(label).width > annotation.width) {
+  while (fontSize > 8 && ctx.measureText(label).width > annotation.width) {
     fontSize -= 0.5;
     ctx.font = `${weight} ${fontSize}px Inter, Arial, sans-serif`;
   }
   const baseline = annotation.y + Math.min(Math.max(fontSize + 2, annotation.height * 0.78), annotation.height - 2);
   ctx.textBaseline = "alphabetic";
-  ctx.fillText(label, annotation.x, baseline);
+  ctx.fillText(label, annotation.x, baseline, annotation.width);
   ctx.restore();
 }
 
@@ -1020,10 +1687,10 @@ async function renderPdfPages() {
     const canvasContext = canvas.getContext("2d");
     await page.render({ canvasContext, viewport }).promise;
     const pageAnnotations = state.annotations.filter((annotation) => annotation.pageNumber === i);
-    const skippedSpanIds = getSkippedTextSpanIds(pageData, state.annotations);
-    eraseTextSpans(canvasContext, pageData, skippedSpanIds);
-    const positionedAnnotations = layoutReplacementAnnotations(pageData, pageAnnotations);
+    const positionedAnnotations = layoutReplacementAnnotations(pageData, pageAnnotations, canvasContext);
+    clearReplacementRegions(canvasContext, positionedAnnotations);
     drawReplacementTexts(canvasContext, positionedAnnotations);
+    drawVisualSamplingDebug(canvasContext, pageData);
     pageEl.appendChild(canvas);
 
     positionedAnnotations.forEach((annotation) => {
@@ -1170,9 +1837,8 @@ function renderSample() {
   ctx.fillText("History Notes", 82, 92);
   ctx.font = "15px Arial";
   wrapCanvasText(ctx, sampleText, 82, 150, 690, 22);
-  const sourceReplacements = getSourceReplacements(state.pages[0], state.annotations);
-  sourceReplacements.forEach(({ source }) => eraseSourceText(ctx, source, state.pages[0]));
-  const positionedAnnotations = layoutReplacementAnnotations(state.pages[0], state.annotations);
+  const positionedAnnotations = layoutReplacementAnnotations(state.pages[0], state.annotations, ctx);
+  clearReplacementRegions(ctx, positionedAnnotations);
   drawReplacementTexts(ctx, positionedAnnotations);
   pageEl.appendChild(canvas);
   positionedAnnotations.forEach((annotation) => {

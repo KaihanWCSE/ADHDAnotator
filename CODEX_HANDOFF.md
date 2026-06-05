@@ -1,89 +1,34 @@
 # Codex Handoff
 
-Use this file to resume work on ADHD Annotator after reinstalling Codex or starting a new chat.
+Project: ADHD Annotator / PDF Annotator AI
+Repo: https://github.com/KaihanWCSE/ADHDAnotator.git
+Local path: `D:\Projects\adhdanotator`
+Live app: https://pdf-annotator-ai.butterbase.dev
+Butterbase app id: `app_jnnlkgx7ehdy`
 
-## Project
+## Structure
 
-- Name: ADHD Annotator
-- Repo: https://github.com/KaihanWCSE/ADHDAnotator.git
-- Local path: `C:\Users\Kai's Desktop\Documents\ADHD Anotator`
-- Live URL: https://pdf-annotator-ai.butterbase.dev
-- Butterbase app id: `app_jnnlkgx7ehdy`
-- Current branch: `main`
-- Latest known pushed commit: `89b343b Optimize AI summaries with sentence ranges`
+- `index.html`, `styles.css`, `app.js`: static frontend deployed to Butterbase.
+- `app.js`: browser PDF pipeline. It loads PDF.js, extracts spans/lines/blocks, filters summarizable source blocks, calls the backend, renders PDF pages to canvas, clears source regions, draws blue AI headers and red AI bullets, and overlays invisible clickable annotation buttons.
+- `butterbase-functions/summarize-document/`: backend summarization function. It receives extracted source blocks, filters unsafe/short content again, sends numbered sentences to Butterbase AI, validates sentence ranges, and returns source-linked sections/bullets.
+- `butterbase-functions/list-ai-models/`: model picker endpoint.
+- `test/summarize-document.test.js`: backend contract tests, run with `npm test`.
 
-## Current Architecture
+## Current State
 
-- Static frontend: `index.html`, `styles.css`, `app.js`
-- PDF parsing: PDF.js runs in the browser and extracts selectable text, coordinates, font metadata, lines, blocks, and spans.
-- Backend: Butterbase serverless functions in `butterbase-functions/`
-- AI: Butterbase AI Gateway chat completions endpoint.
-- Rendering: the frontend renders original PDF pages to canvas, erases selected original text spans, draws section headers and bullet summaries, and overlays clickable invisible buttons for source popovers.
+- Current work is focused on PDF text detection, especially excluding callout/example/gray-box text while keeping real large paragraphs.
+- The intended inclusion model is: split extracted lines at obvious boundaries, group nearby paragraph text, then summarize only groups with at least 40 words and at least 3 sentences.
+- Avoid hardcoded label-word exclusions. Prefer geometry/visual signals: background change, text color change, font size/style/weight change, table-like layout, short-label-line density, numeric-symbol density, and line spacing.
+- A debug build is currently deployed with visual sampling overlays enabled:
+  - Green: kept lines
+  - Amber: header/label boundary lines
+  - Pink: visual outlier lines
+  - Purple: visual boundary/new visual block
+  - Gray: table-like lines
+  - Cyan: exact per-span pixel sample boxes
 
-## Current Backend Endpoints
+## Known Bug
 
-- `GET /fn/list-ai-models`
-  - Lists curated Butterbase AI chat models for the model picker.
-  - Preferred models:
-    - `openai/gpt-4.1-mini`
-    - `google/gemini-3.1-flash-lite`
-    - `anthropic/claude-sonnet-4.6`
-    - `anthropic/claude-opus-4.7`
+On `testWithTable.pdf`, gray-box/callout text is still leaking into summaries, for example `Core idea...` and `Examples...` bullets. The same run also detects too few text blocks overall, currently about 2 blocks for a 4-page PDF, leaving page 4 mostly untransformed.
 
-- `POST /fn/summarize-document`
-  - Receives extracted PDF text blocks from the browser.
-  - Filters headers, page numbers, short blocks, and non-long-form text.
-  - Splits remaining content into numbered sentences.
-  - Sends numbered sentences only to the selected LLM.
-  - Requires compact JSON with section ranges and bullet ranges.
-  - Validates every sentence is covered exactly once by sections and bullets.
-  - Reconstructs exact source text locally from sentence ranges.
-  - Retries with `google/gemini-3.1-flash-lite` if default `openai/gpt-4.1-mini` fails.
-
-## Important Current Logic
-
-- Frontend skips summarizing blocks with fewer than 3 sentences or fewer than 40 words.
-- Backend repeats the same filtering for safety.
-- `isLikelyHeaderBlock()` identifies numeric section labels, page markers, title-like short lines, colon headers, and emphasized short headers.
-- Expected skip cases return HTTP 200 with `{ skipped: true }` so Butterbase does not send failure emails.
-- The PDF file itself is not currently uploaded during the active transform path; the browser parses the PDF locally and sends extracted text to Butterbase.
-- `uploadPdf()` and the old storage path exist in `app.js`, but `processCurrentPdf()` currently does not call it.
-
-## Main Product Flow
-
-1. User uploads/selects a PDF.
-2. Browser loads PDF.js.
-3. Browser extracts text spans from every page.
-4. Text spans are grouped into lines and then source blocks.
-5. Header-like and short blocks are skipped.
-6. User chooses an AI model.
-7. Frontend calls `POST /fn/summarize-document`.
-8. Backend sends numbered sentences to Butterbase AI.
-9. LLM returns section titles, section sentence ranges, bullet labels, and bullet sentence ranges.
-10. Backend validates ranges and rebuilds exact source text locally.
-11. Frontend converts the result into annotations.
-12. PDF pages are rendered to canvas.
-13. Original source spans are erased.
-14. Blue headers and red clickable bullets are drawn.
-15. Clicking a bullet opens a popover with exact original text.
-
-## Known Constraints
-
-- Works best with selectable-text PDFs.
-- Scanned/image-only PDFs need OCR later.
-- Complex multi-column layouts, tables, or unusual PDF fonts can still confuse extraction.
-- There is no saved document history yet.
-- There are no formal automated tests yet.
-- Butterbase credentials and API keys should stay outside the repo.
-
-## Good Next Steps
-
-1. Decide whether to fully use Butterbase Storage for uploaded PDFs or remove the inactive storage path.
-2. Add persistence for processed summaries so users can reopen a PDF without paying for another LLM call.
-3. Add a lightweight regression test for the sentence-range summarization contract.
-4. Improve multi-column/table detection.
-5. Add OCR for scanned PDFs.
-
-## Resume Summary
-
-Built a 1st-place hackathon PDF reading tool that converts dense academic PDF paragraphs into ADHD-friendly clickable bullet annotations. Implemented a browser PDF.js extraction pipeline, Butterbase serverless functions, model selection, compact sentence-range LLM prompting, strict coverage validation, fallback model retry, local source reconstruction, and canvas-based annotation rendering.
+The likely problem is that `sampleTextVisualStyle()` samples very tight rectangles around PDF text spans, so the measured background may not represent the visual callout box. The next useful step is to inspect the deployed overlay and then improve sampling to use wider line bands / local background regions, with the main page background derived from strong paragraph candidates instead of all non-table lines.
