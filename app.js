@@ -1,8 +1,13 @@
 const APP_ID = "app_jnnlkgx7ehdy";
 const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
+const TESSERACT_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL = "openai/gpt-4.1-mini";
+const OCR_MAX_SCANNED_PAGES = 3;
+const OCR_RENDER_SCALE = 2.4;
+const SCANNED_SELECTABLE_WORD_LIMIT = 18;
+const SCANNED_SOURCE_BLOCK_LIMIT = 0;
 
 const FALLBACK_MODELS = [
   { id: "openai/gpt-4.1-mini", name: "Balanced - GPT-4.1 Mini", prompt_price_per_mtok: 0.48, completion_price_per_mtok: 1.92 },
@@ -28,6 +33,9 @@ const state = {
   objectId: null,
   models: [],
   selectedModel: DEFAULT_MODEL,
+  extractionMode: "text",
+  ocrApplied: false,
+  ocrUnavailableReason: "",
 };
 
 const els = {
@@ -57,6 +65,39 @@ async function loadPdfJs() {
   const pdfjsLib = await import("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs");
   pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_URL;
   return pdfjsLib;
+}
+
+let tesseractLoadPromise = null;
+
+function loadExternalScript(src) {
+  return new Promise((resolve, reject) => {
+    const existing = [...document.scripts].find((script) => script.src === src);
+    if (existing && existing.dataset.loaded === "true") {
+      resolve();
+      return;
+    }
+
+    const script = existing || document.createElement("script");
+    script.src = src;
+    script.async = true;
+    script.crossOrigin = "anonymous";
+    script.addEventListener("load", () => {
+      script.dataset.loaded = "true";
+      resolve();
+    }, { once: true });
+    script.addEventListener("error", () => reject(new Error("Could not load OCR engine.")), { once: true });
+    if (!existing) document.head.appendChild(script);
+  });
+}
+
+async function loadTesseract() {
+  if (!tesseractLoadPromise) {
+    tesseractLoadPromise = loadExternalScript(TESSERACT_SCRIPT_URL).then(() => {
+      if (!window.Tesseract?.createWorker) throw new Error("OCR engine did not initialize.");
+      return window.Tesseract;
+    });
+  }
+  return tesseractLoadPromise;
 }
 
 function setStatus(text, progress) {
@@ -1074,6 +1115,404 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber, analysi
   };
 }
 
+function getSelectableTextStats(pages = state.pages) {
+  const selectableText = normalizeText(
+    pages
+      .flatMap((page) => page.textSpans || [])
+      .map((span) => span.text)
+      .join(" "),
+  );
+  return {
+    words: countWords(selectableText),
+    spans: pages.reduce((total, page) => total + (page.textSpans?.length || 0), 0),
+    sourceBlocks: pages.flatMap((page) => page.items || []).filter(isReadableSourceBlock).length,
+  };
+}
+
+function shouldTryOcrForParsedPdf(pages, pageCount) {
+  if (!pageCount) return false;
+  const stats = getSelectableTextStats(pages);
+  if (stats.sourceBlocks > SCANNED_SOURCE_BLOCK_LIMIT) return false;
+  return stats.words <= Math.max(SCANNED_SELECTABLE_WORD_LIMIT, pageCount * 8)
+    || stats.spans <= pageCount * 3;
+}
+
+function getOcrBox(node) {
+  const box = node?.bbox || node?.box || null;
+  if (box && Number.isFinite(box.x0) && Number.isFinite(box.y0) && Number.isFinite(box.x1) && Number.isFinite(box.y1)) {
+    return {
+      left: box.x0,
+      top: box.y0,
+      width: box.x1 - box.x0,
+      height: box.y1 - box.y0,
+    };
+  }
+  if (box && Number.isFinite(box.left) && Number.isFinite(box.top) && Number.isFinite(box.width) && Number.isFinite(box.height)) {
+    return {
+      left: box.left,
+      top: box.top,
+      width: box.width,
+      height: box.height,
+    };
+  }
+  if (Number.isFinite(node?.left) && Number.isFinite(node?.top) && Number.isFinite(node?.width) && Number.isFinite(node?.height)) {
+    return {
+      left: node.left,
+      top: node.top,
+      width: node.width,
+      height: node.height,
+    };
+  }
+  return null;
+}
+
+function parseOcrTsv(tsv) {
+  if (!tsv || typeof tsv !== "string") return [];
+  const rows = tsv.trim().split(/\r?\n/);
+  if (rows.length < 2) return [];
+  const headers = rows[0].split("\t");
+  const indexByHeader = new Map(headers.map((header, index) => [header, index]));
+  const read = (cells, key) => cells[indexByHeader.get(key)] ?? "";
+
+  return rows.slice(1).map((row) => {
+    const cells = row.split("\t");
+    const text = normalizeText(read(cells, "text"));
+    const left = Number(read(cells, "left"));
+    const top = Number(read(cells, "top"));
+    const width = Number(read(cells, "width"));
+    const height = Number(read(cells, "height"));
+    return {
+      text,
+      confidence: Number(read(cells, "conf")),
+      blockNumber: read(cells, "block_num"),
+      paragraphNumber: read(cells, "par_num"),
+      lineNumber: read(cells, "line_num"),
+      box: { left, top, width, height },
+    };
+  }).filter((word) => (
+    word.text
+    && Number.isFinite(word.box.left)
+    && Number.isFinite(word.box.top)
+    && Number.isFinite(word.box.width)
+    && Number.isFinite(word.box.height)
+    && word.box.width > 0
+    && word.box.height > 0
+  ));
+}
+
+function collectOcrWords(data) {
+  if (Array.isArray(data?.words) && data.words.length) {
+    return data.words.map((word) => {
+      const box = getOcrBox(word);
+      return {
+        text: normalizeText(word.text || word.symbols?.map((symbol) => symbol.text).join("") || ""),
+        confidence: Number(word.confidence),
+        box,
+      };
+    }).filter((word) => word.text && word.box?.width > 0 && word.box?.height > 0);
+  }
+  return parseOcrTsv(data?.tsv);
+}
+
+function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analysisContext = null) {
+  const scaleX = viewport.width / Math.max(1, ocrViewport.width);
+  const scaleY = viewport.height / Math.max(1, ocrViewport.height);
+
+  const spans = words
+    .filter((word) => !Number.isFinite(word.confidence) || word.confidence >= 25)
+    .map((word, index) => {
+      const x = word.box.left * scaleX;
+      const y = word.box.top * scaleY;
+      const width = word.box.width * scaleX;
+      const height = word.box.height * scaleY;
+      const fontSize = Math.max(8, height * 0.78);
+      const visualStyle = sampleTextVisualStyle(analysisContext, { x, y, width, height });
+      return {
+        id: `p${pageNumber}-ocr-s${index}`,
+        text: word.text,
+        x,
+        y,
+        baselineY: y + height * 0.82,
+        width,
+        height,
+        fontSize,
+        fontFamily: "Arial, Helvetica, sans-serif",
+        fontName: "OCR",
+        fontStyle: "normal",
+        fontWeight: 400,
+        backgroundColor: visualStyle.backgroundColor,
+        textColor: visualStyle.textColor,
+        sampleBox: visualStyle.sampleBox,
+        textLength: word.text.length,
+      };
+    })
+    .filter((span) => span.text && span.width > 0 && span.height > 0);
+
+  const medianFont = median(spans.map((span) => span.fontSize));
+  const lineBuckets = [];
+
+  [...spans].sort((a, b) => a.y - b.y || a.x - b.x).forEach((span) => {
+    const centerY = span.y + span.height / 2;
+    let bestBucket = null;
+    let bestDistance = Infinity;
+    lineBuckets.forEach((bucket) => {
+      const distance = Math.abs(centerY - bucket.centerY);
+      const threshold = Math.max(medianFont * 0.72, Math.min(bucket.height, span.height) * 0.8);
+      if (distance <= threshold && distance < bestDistance) {
+        bestBucket = bucket;
+        bestDistance = distance;
+      }
+    });
+
+    if (!bestBucket) {
+      lineBuckets.push({
+        centerY,
+        height: span.height,
+        spans: [span],
+      });
+      return;
+    }
+
+    bestBucket.spans.push(span);
+    bestBucket.centerY = median(bestBucket.spans.map((item) => item.y + item.height / 2));
+    bestBucket.height = median(bestBucket.spans.map((item) => item.height));
+  });
+
+  let lineIndex = 0;
+  const lines = lineBuckets
+    .sort((a, b) => a.centerY - b.centerY)
+    .flatMap((bucket) => {
+      const ordered = bucket.spans.sort((a, b) => a.x - b.x);
+      const runs = splitLineSpansIntoRuns(ordered, medianFont, viewport.width);
+      const rowText = normalizeText(ordered.map((span) => span.text).join(" "));
+      const rowLooksTableLike = isLikelyTableRow(runs, rowText);
+      return runs.map((run) => {
+        lineIndex += 1;
+        return buildLineFromSpans(run, `p${pageNumber}-ocr-l${lineIndex}`, rowLooksTableLike, runs.length);
+      });
+    });
+
+  if (analysisContext) {
+    const samplingContext = {
+      lines,
+      columns: detectTextColumns(lines, viewport.width, medianFont),
+    };
+    lines.forEach((line) => {
+      const visualStyle = sampleLineVisualStyle(analysisContext, line, medianFont, viewport.width, samplingContext);
+      line.backgroundColor = visualStyle.backgroundColor || line.backgroundColor;
+      line.textColor = visualStyle.textColor || line.textColor;
+      line.sampleBox = visualStyle.sampleBox || line.sampleBox;
+      line.sampleBoxes = visualStyle.sampleBoxes || line.sampleBoxes || [];
+    });
+  }
+
+  return { spans, lines, medianFont };
+}
+
+function normalizeOcrLineText(line) {
+  const text = normalizeText(line.text);
+  if (!text) return "";
+  if (/[.!?]$/.test(text)) return text;
+  if (countWords(text) >= 6) return `${text}.`;
+  return text;
+}
+
+function makeBlockFromLines(lines, id, pageNumber, viewport, medianFont, pageVisualReference) {
+  const text = normalizeText(lines.map(normalizeOcrLineText).join(" "));
+  const x = Math.min(...lines.map((line) => line.x));
+  const y = Math.min(...lines.map((line) => line.y));
+  const right = Math.max(...lines.map((line) => line.x + line.width));
+  const bottom = Math.max(...lines.map((line) => line.y + line.height));
+  const block = {
+    id,
+    pageNumber,
+    fromOcr: true,
+    text,
+    x,
+    y,
+    width: right - x,
+    height: bottom - y,
+    fontSize: median(lines.map((line) => line.fontSize)),
+    fontWeight: median(lines.map((line) => line.fontWeight)),
+    lineBoxes: lines.map((line) => ({
+      x: line.x,
+      y: line.y,
+      baselineY: median(line.segments.map((segment) => segment.baselineY)),
+      width: line.width,
+      height: line.height,
+      fontSize: line.fontSize,
+      fontWeight: line.fontWeight,
+      fontFamily: line.fontFamily,
+      fontName: line.fontName,
+      fontStyle: line.fontStyle,
+      backgroundColor: line.backgroundColor,
+      textColor: line.textColor,
+      sampleBox: line.sampleBox,
+      sampleBoxes: line.sampleBoxes || [],
+      text: line.text,
+      textLength: line.textLength,
+      tableLike: Boolean(line.tableLike),
+      rowRunCount: line.rowRunCount || 1,
+      segments: line.segments,
+    })),
+    visualReference: pageVisualReference,
+  };
+
+  block.spanIds = block.lineBoxes.flatMap((line) => line.segments.map((segment) => segment.id));
+  block.tableLike = isLikelyTableBlock(block);
+  block.kind = block.tableLike ? "table" : classifyBlock(block, medianFont);
+  block.visualDivergence = summarizeBlockVisualDivergence(block, pageVisualReference, medianFont);
+
+  const item = {
+    ...block,
+    x: Math.max(0, block.x - 2),
+    y: Math.max(0, block.y - 2),
+    width: Math.min(viewport.width - Math.max(0, block.x - 2), block.width + 6),
+    height: block.height + 4,
+    textLength: block.text.length,
+  };
+  item.sourceRejectReason = getSourceBlockRejectReason(item);
+  return item;
+}
+
+function buildBlocksFromOcrLines(rawLines, viewport, pageNumber, medianFont) {
+  const lines = sortLinesForReadingOrder(rawLines, viewport.width, medianFont);
+  const pageVisualReference = getLineVisualReference(getPageVisualReferenceLines(lines, viewport.width, medianFont));
+  const debugLines = [];
+  const blocks = [];
+  let current = [];
+
+  const addDebugLine = (line, status, details = {}) => {
+    debugLines.push({
+      id: line.id,
+      status,
+      text: line.text,
+      x: line.x,
+      y: line.y,
+      width: line.width,
+      height: line.height,
+      sampleBox: line.sampleBox,
+      sampleBoxes: line.sampleBoxes || [],
+      backgroundColor: line.backgroundColor,
+      textColor: line.textColor,
+      fontSize: line.fontSize,
+      fontWeight: line.fontWeight,
+      tableLike: Boolean(line.tableLike),
+      ...details,
+    });
+  };
+
+  const flush = () => {
+    if (!current.length) return;
+    blocks.push(makeBlockFromLines(current, `p${pageNumber}-ocr-b${blocks.length}`, pageNumber, viewport, medianFont, pageVisualReference));
+    current = [];
+  };
+
+  lines.forEach((line) => {
+    const boundaryReasons = getBoundaryLabelReasons(line, medianFont);
+    const visualOutlierReasons = getLineVisualOutlierReasons(line, pageVisualReference, medianFont);
+    if (line.tableLike || boundaryReasons.length || visualOutlierReasons.length) {
+      addDebugLine(line, line.tableLike ? "table" : boundaryReasons.length ? "boundary-label" : "visual-outlier", {
+        reasons: [
+          ...(line.tableLike ? ["table-row"] : []),
+          ...boundaryReasons,
+          ...visualOutlierReasons,
+        ],
+      });
+      flush();
+      return;
+    }
+
+    const previous = current[current.length - 1];
+    const gap = previous ? line.y - (previous.y + previous.height) : 999;
+    const sameColumn = previous ? (
+      Math.abs(line.x - previous.x) < medianFont * 5
+      || textBlocksOverlap({ x: previous.x, width: previous.width }, { x: line.x, width: line.width }) > 0.28
+    ) : false;
+    const paragraphFlow = previous && sameColumn && gap <= medianFont * 3.4;
+
+    if (!paragraphFlow) flush();
+    addDebugLine(line, "kept");
+    current.push(line);
+  });
+  flush();
+
+  const readableBlocks = blocks.filter(isReadableSourceBlock);
+  if (readableBlocks.length || countWords(lines.map((line) => line.text).join(" ")) < 40) {
+    return { items: blocks, debugLines };
+  }
+
+  const bodyLines = lines.filter((line) => (
+    !line.tableLike
+    && !isBoundaryLabelLine(line, medianFont)
+    && !getLineVisualOutlierReasons(line, pageVisualReference, medianFont).length
+  ));
+  if (countWords(bodyLines.map((line) => line.text).join(" ")) < 40) return { items: blocks, debugLines };
+
+  const fallbackBlock = makeBlockFromLines(bodyLines, `p${pageNumber}-ocr-body`, pageNumber, viewport, medianFont, pageVisualReference);
+  return {
+    items: [fallbackBlock],
+    debugLines: debugLines.map((line) => ({ ...line, fallbackBodyBlock: true })),
+  };
+}
+
+function extractBlocksFromOcrData(data, viewport, ocrViewport, pageNumber, analysisContext = null) {
+  const words = collectOcrWords(data);
+  const { spans, lines, medianFont } = buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analysisContext);
+  const { items, debugLines } = buildBlocksFromOcrLines(lines, viewport, pageNumber, medianFont);
+  return { items, textSpans: spans, debugLines };
+}
+
+async function renderPageToCanvas(page, viewport) {
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.ceil(viewport.width);
+  canvas.height = Math.ceil(viewport.height);
+  const ctx = canvas.getContext("2d", { willReadFrequently: true }) || canvas.getContext("2d");
+  if (!ctx) throw new Error("Could not prepare PDF page for OCR.");
+  await page.render({ canvasContext: ctx, viewport }).promise;
+  return { canvas, ctx };
+}
+
+async function runOcrForPdf(pdf) {
+  const Tesseract = await loadTesseract();
+  const worker = await Tesseract.createWorker("eng", 1, {
+    logger: (message) => {
+      if (message?.status && message.status !== "recognizing text") return;
+      if (message?.status === "recognizing text" && Number.isFinite(message.progress)) {
+        setStatus(`Running OCR... ${Math.round(message.progress * 100)}%`, 48 + message.progress * 22);
+      }
+    },
+  });
+
+  try {
+    const ocrPages = [];
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      setStatus(`Running OCR on page ${pageNumber} of ${pdf.numPages}...`, 48 + (pageNumber / pdf.numPages) * 24);
+      const page = await pdf.getPage(pageNumber);
+      const viewport = page.getViewport({ scale: 1.35 });
+      const analysisContext = await renderPageAnalysisContext(page, viewport);
+      const ocrViewport = page.getViewport({ scale: OCR_RENDER_SCALE });
+      const { canvas } = await renderPageToCanvas(page, ocrViewport);
+      const result = await worker.recognize(canvas);
+      const pageText = extractBlocksFromOcrData(result.data, viewport, ocrViewport, pageNumber, analysisContext);
+      ocrPages.push({
+        pageNumber,
+        width: viewport.width,
+        height: viewport.height,
+        items: pageText.items,
+        textSpans: pageText.textSpans,
+        debugLines: pageText.debugLines || [],
+        extractionMode: "ocr",
+      });
+    }
+    state.pages = ocrPages;
+    state.extractionMode = "ocr";
+    state.ocrApplied = true;
+  } finally {
+    await worker.terminate();
+  }
+}
+
 async function renderPageAnalysisContext(page, viewport) {
   const canvas = document.createElement("canvas");
   canvas.width = Math.ceil(viewport.width);
@@ -1095,6 +1534,9 @@ async function parsePdf(file) {
   const pdf = await pdfjsLib.getDocument({ data: buffer }).promise;
   state.pdf = pdf;
   state.pages = [];
+  state.extractionMode = "text";
+  state.ocrApplied = false;
+  state.ocrUnavailableReason = "";
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     setStatus(`Reading page ${pageNumber} of ${pdf.numPages}...`, 8 + (pageNumber / pdf.numPages) * 34);
@@ -1112,6 +1554,21 @@ async function parsePdf(file) {
       debugLines: pageText.debugLines || [],
     });
   }
+
+  const looksScanned = shouldTryOcrForParsedPdf(state.pages, pdf.numPages);
+  if (!looksScanned) {
+    return { looksScanned: false, ocrApplied: false };
+  }
+
+  if (pdf.numPages > OCR_MAX_SCANNED_PAGES) {
+    state.extractionMode = "scanned-unavailable";
+    state.ocrUnavailableReason = "too-many-pages";
+    return { looksScanned: true, ocrApplied: false, ocrUnavailableReason: state.ocrUnavailableReason };
+  }
+
+  setStatus("This PDF looks scanned. Reading it with OCR...", 46);
+  await runOcrForPdf(pdf);
+  return { looksScanned: true, ocrApplied: true };
 }
 
 async function uploadPdf(file) {
@@ -1146,17 +1603,23 @@ function getSourceBlockRejectReason(item) {
   const text = normalizeText(item.text);
   const lines = item.lineBoxes || [];
   const medianFont = Math.max(8, item.fontSize || median(lines.map((line) => line.fontSize)));
+  const wordCount = countWords(text);
+  const sentenceCount = countSentences(text);
+  const ocrParagraphLike = Boolean(item.fromOcr)
+    && wordCount >= 55
+    && lines.length >= 4
+    && wordCount / Math.max(1, lines.length) >= 7;
   if (!text) return "empty";
   if (item.kind === "table" || item.tableLike) return "table-like";
   if (isLikelyHeaderBlock(item)) return "header-like";
   if (isPageNumberText(text)) return "page-number";
   if (hasVisualCalloutStyle(item, medianFont)) return "visual-callout";
-  if (countSentences(text) < 3) return "too-few-sentences";
-  if (countWords(text) < 40) return "too-few-words";
+  if (sentenceCount < 3 && !ocrParagraphLike) return "too-few-sentences";
+  if (wordCount < 40) return "too-few-words";
   if (numericTokenRatio(text) > 0.45) return "numeric-heavy";
   if (isMostlyShortLabelLines(lines)) return "short-label-lines";
   if (!hasReasonableLineSpacing(lines, medianFont)) return "irregular-line-spacing";
-  if (!["paragraph", "text", "bullet"].includes(item.kind) && countSentences(text) <= 0) return "unsupported-kind";
+  if (!["paragraph", "text", "bullet"].includes(item.kind) && sentenceCount <= 0) return "unsupported-kind";
   return "";
 }
 
@@ -2019,10 +2482,29 @@ async function handleFile(file) {
   els.pages.innerHTML = "";
   setStatus("Loading PDF...", 5);
   try {
-    await parsePdf(file);
+    const parseResult = await parsePdf(file);
     refreshCounters();
-    els.processButton.disabled = false;
-    setStatus("PDF ready. Transform it when you are ready.", 45);
+    const sourceCount = getSourceItems().length;
+    els.processButton.disabled = sourceCount < 1;
+
+    if (parseResult.ocrUnavailableReason === "too-many-pages") {
+      setStatus(`This looks like a scanned PDF. Browser OCR is available for scanned PDFs up to ${OCR_MAX_SCANNED_PAGES} pages right now.`, 0);
+      return;
+    }
+
+    if (parseResult.ocrApplied && sourceCount < 1) {
+      setStatus("OCR finished, but I could not find enough readable paragraph text to transform.", 0);
+      return;
+    }
+
+    if (sourceCount < 1) {
+      setStatus("I could not find enough large paragraph text to transform in this PDF.", 0);
+      return;
+    }
+
+    setStatus(parseResult.ocrApplied
+      ? "OCR complete. PDF ready. Transform it when you are ready."
+      : "PDF ready. Transform it when you are ready.", 45);
   } catch (error) {
     console.error(error);
     setStatus(error.message || "Could not read PDF.", 0);
