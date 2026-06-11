@@ -16,8 +16,8 @@ const HEADER_COLOR_PALETTE = ["#2563eb", "#1d4ed8", "#1e40af", "#60a5fa", "#93c5
 const BULLET_COLOR_PALETTE = ["#9f1239", "#dc2626", "#b91c1c", "#f43f5e", "#fb7185", "#fca5a5", "#7f1d1d", "#fff1f2"];
 const DEBUG_SOURCE_REGION_OVERLAY = false;
 const DEBUG_SOURCE_SEGMENT_RECTS = false;
-const DEBUG_VISUAL_SAMPLING_BANDS = true;
-const DEBUG_VISUAL_SPAN_SAMPLE_BOXES = true;
+const DEBUG_VISUAL_SAMPLING_BANDS = false;
+const DEBUG_VISUAL_SPAN_SAMPLE_BOXES = false;
 
 const state = {
   file: null,
@@ -182,15 +182,20 @@ function isPageNumberText(text) {
 }
 
 function isBoundaryLabelLine(line, medianFont = 12) {
+  return getBoundaryLabelReasons(line, medianFont).length > 0;
+}
+
+function getBoundaryLabelReasons(line, medianFont = 12) {
   const text = normalizeText(line.text);
-  if (!text) return true;
-  if (isPageNumberText(text)) return true;
+  const reasons = [];
+  if (!text) reasons.push("empty");
+  if (isPageNumberText(text)) reasons.push("page-number");
 
   const words = countWords(text);
   const sentenceCount = countSentences(text);
-  if (words <= 10 && sentenceCount === 0 && /:$/.test(text)) return true;
-  if (isLikelyHeaderBlock(line, medianFont)) return true;
-  return false;
+  if (words <= 10 && sentenceCount === 0 && /:$/.test(text)) reasons.push("punctuated-label");
+  if (isLikelyHeaderBlock(line, medianFont)) reasons.push("header-like");
+  return reasons;
 }
 
 function isMostlyShortLabelLines(lines) {
@@ -215,6 +220,31 @@ function hasReasonableLineSpacing(lines, medianFont = 12) {
   if (!positiveGaps.length) return true;
   const largeGaps = positiveGaps.filter((gap) => gap > medianFont * 4.5);
   return largeGaps.length / positiveGaps.length <= 0.25 && Math.max(...positiveGaps) <= medianFont * 12;
+}
+
+function isStrongParagraphReferenceLine(line, medianFont = 12, pageWidth = 0) {
+  const text = normalizeText(line.text);
+  if (!text || line.tableLike) return false;
+  if (isBoundaryLabelLine(line, medianFont)) return false;
+  if (numericTokenRatio(text) > 0.28) return false;
+
+  const words = countWords(text);
+  const sentenceCount = countSentences(text);
+  const fontSize = Math.max(8, line.fontSize || medianFont);
+  const normalFontSize = Math.abs(fontSize - medianFont) <= Math.max(2.2, medianFont * 0.22);
+  const normalWeight = (line.fontWeight || 400) < 650;
+  const enoughText = words >= 7 || text.length >= 52 || (words >= 5 && sentenceCount > 0);
+  const enoughWidth = line.width >= Math.max(medianFont * 10, (pageWidth || 0) * 0.12);
+  return normalFontSize && normalWeight && enoughText && enoughWidth;
+}
+
+function getPageVisualReferenceLines(lines, pageWidth, medianFont = 12) {
+  const strongLines = lines.filter((line) => isStrongParagraphReferenceLine(line, medianFont, pageWidth));
+  if (strongLines.length >= 3) return strongLines;
+
+  return lines
+    .filter((line) => !line.tableLike)
+    .filter((line) => !isBoundaryLabelLine(line, medianFont));
 }
 
 function getClampedSampleBox(ctx, rect, padding = 2) {
@@ -253,6 +283,11 @@ function getUnionRect(rects) {
   };
 }
 
+function getRectArea(rect) {
+  if (!rect) return 0;
+  return Math.max(0, rect.width || 0) * Math.max(0, rect.height || 0);
+}
+
 function getDominantColor(colors) {
   const buckets = new Map();
   colors.filter(Boolean).forEach((color) => {
@@ -281,6 +316,22 @@ function getDominantValue(values) {
   const counts = new Map();
   values.filter(Boolean).forEach((value) => counts.set(value, (counts.get(value) || 0) + 1));
   return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || "";
+}
+
+function readVisualSample(ctx, sampleBox) {
+  if (!ctx || !sampleBox) return { backgroundColor: null, textColor: null, sampleBox: null };
+
+  try {
+    const pixels = ctx.getImageData(sampleBox.x, sampleBox.y, sampleBox.width, sampleBox.height).data;
+    const backgroundColor = getDominantBackgroundColorFromPixels(pixels);
+    return {
+      backgroundColor,
+      textColor: getDominantInkColorFromPixels(pixels, backgroundColor),
+      sampleBox,
+    };
+  } catch (_) {
+    return { backgroundColor: null, textColor: null, sampleBox: null };
+  }
 }
 
 function getDominantInkColorFromPixels(pixels, background) {
@@ -320,19 +371,133 @@ function getDominantInkColorFromPixels(pixels, background) {
 
 function sampleTextVisualStyle(ctx, rect) {
   const sampleBox = getClampedSampleBox(ctx, rect, 2);
-  if (!sampleBox) return { backgroundColor: null, textColor: null, sampleBox: null };
+  return readVisualSample(ctx, sampleBox);
+}
 
-  try {
-    const pixels = ctx.getImageData(sampleBox.x, sampleBox.y, sampleBox.width, sampleBox.height).data;
-    const backgroundColor = getDominantBackgroundColorFromPixels(pixels);
+function clampHorizontalBounds(left, right, pageWidth) {
+  const maxRight = pageWidth || right;
+  const clampedLeft = Math.max(0, Math.min(left, maxRight));
+  const clampedRight = Math.max(clampedLeft, Math.min(right, maxRight));
+  return { left: clampedLeft, right: clampedRight };
+}
+
+function getColumnSamplingBounds(line, columns = [], pageWidth = 0, medianFont = 12) {
+  const columnIndex = columnIndexForLine(line, columns, pageWidth, medianFont);
+  if (columnIndex === null) return null;
+
+  const column = columns[columnIndex];
+  if (!column) return null;
+
+  const fontSize = Math.max(8, line.fontSize || medianFont);
+  const pad = Math.max(fontSize * 1.5, medianFont * 1.25);
+  return clampHorizontalBounds(
+    Math.min(line.x - pad, column.minX - pad),
+    Math.max(line.x + line.width + pad, column.maxRight + pad),
+    pageWidth,
+  );
+}
+
+function getNearbySamplingBounds(line, lines = [], pageWidth = 0, medianFont = 12) {
+  if (!lines.length || isPageWideLine(line, pageWidth, medianFont)) return null;
+
+  const fontSize = Math.max(8, line.fontSize || medianFont);
+  const centerY = line.y + line.height / 2;
+  const verticalWindow = Math.max(fontSize * 8, medianFont * 8);
+  const xTolerance = Math.max(fontSize * 5, pageWidth * 0.04);
+  const lineBox = { x: line.x, width: line.width };
+  const fontTolerance = Math.max(2, medianFont * 0.22);
+
+  const nearby = lines.filter((candidate) => {
+    if (!candidate || candidate.id === line.id || candidate.tableLike) return false;
+    if (isPageWideLine(candidate, pageWidth, medianFont)) return false;
+    if (Math.abs((candidate.fontSize || fontSize) - fontSize) > fontTolerance) return false;
+    const candidateCenterY = candidate.y + candidate.height / 2;
+    if (Math.abs(candidateCenterY - centerY) > verticalWindow) return false;
+    const sameColumn = Math.abs(candidate.x - line.x) <= xTolerance || textBlocksOverlap(lineBox, candidate) > 0.2;
+    return sameColumn && candidate.textLength >= 12;
+  });
+
+  if (nearby.length < 1) return null;
+
+  const scopedLines = [...nearby, line];
+  const left = Math.min(line.x, median(scopedLines.map((candidate) => candidate.x)));
+  const right = Math.max(
+    line.x + line.width,
+    median(scopedLines.map((candidate) => candidate.x + candidate.width)),
+  );
+  const pad = Math.max(fontSize * 2, medianFont * 1.5);
+  return clampHorizontalBounds(left - pad, right + pad, pageWidth);
+}
+
+function getLineSamplingBounds(line, samplingContext = {}, pageWidth = 0, medianFont = 12) {
+  return getColumnSamplingBounds(line, samplingContext.columns || [], pageWidth, medianFont)
+    || getNearbySamplingBounds(line, samplingContext.lines || [], pageWidth, medianFont);
+}
+
+function getLineVisualSampleBoxes(ctx, line, medianFont = 12, pageWidth = ctx?.canvas?.width || 0, samplingContext = {}) {
+  if (!ctx || !line) return [];
+  const effectivePageWidth = pageWidth || ctx.canvas.width;
+  const fontSize = Math.max(8, line.fontSize || medianFont);
+  const localPadX = Math.max(6, fontSize * 0.9);
+  const localPadY = Math.max(2, fontSize * 0.32);
+  const bandPadY = Math.max(3, fontSize * 0.45);
+  const samplingBounds = getLineSamplingBounds(line, samplingContext, effectivePageWidth, medianFont);
+  const fallbackBandWidth = Math.min(effectivePageWidth * 0.72, Math.max(line.width + fontSize * 4, fontSize * 14));
+  const boundedBandWidth = samplingBounds ? samplingBounds.right - samplingBounds.left : fallbackBandWidth;
+  const bandWidth = Math.min(
+    effectivePageWidth,
+    Math.max(line.width + fontSize * 2.6, Math.min(boundedBandWidth, fallbackBandWidth)),
+  );
+  const lineCenter = line.x + line.width / 2;
+  const minBandX = samplingBounds ? samplingBounds.left : 0;
+  const maxBandX = samplingBounds ? samplingBounds.right - bandWidth : effectivePageWidth - bandWidth;
+  const bandX = Math.max(minBandX, Math.min(maxBandX, lineCenter - bandWidth / 2));
+  const candidates = [
+    {
+      x: line.x - localPadX,
+      y: line.y - localPadY,
+      width: line.width + localPadX * 2,
+      height: Math.max(line.height + localPadY * 2, fontSize * 1.45),
+    },
+    {
+      x: bandX,
+      y: line.y - bandPadY,
+      width: bandWidth,
+      height: Math.max(line.height + bandPadY * 2, fontSize * 1.75),
+    },
+  ];
+
+  return candidates
+    .map((candidate) => getClampedSampleBox(ctx, candidate, 0))
+    .filter(Boolean);
+}
+
+function sampleLineVisualStyle(ctx, line, medianFont = 12, pageWidth = ctx?.canvas?.width || 0, samplingContext = {}) {
+  const sampleBoxes = getLineVisualSampleBoxes(ctx, line, medianFont, pageWidth, samplingContext);
+  if (!sampleBoxes.length) {
     return {
-      backgroundColor,
-      textColor: getDominantInkColorFromPixels(pixels, backgroundColor),
-      sampleBox,
+      backgroundColor: line.backgroundColor || null,
+      textColor: line.textColor || null,
+      sampleBox: line.sampleBox || null,
     };
-  } catch (_) {
-    return { backgroundColor: null, textColor: null, sampleBox: null };
   }
+
+  const samples = sampleBoxes.map((sampleBox) => readVisualSample(ctx, sampleBox));
+  const backgroundColor = getDominantColor([
+    ...samples.map((sample) => sample.backgroundColor),
+    line.backgroundColor,
+  ]);
+  const textColor = getDominantColor([
+    line.textColor,
+    ...samples.map((sample) => sample.textColor),
+  ]);
+  const sampleBox = sampleBoxes.sort((a, b) => getRectArea(b) - getRectArea(a))[0] || line.sampleBox || null;
+
+  return {
+    backgroundColor,
+    textColor,
+    sampleBox,
+  };
 }
 
 function getLineVisualReference(lines) {
@@ -351,7 +516,7 @@ function hasMeaningfulBackgroundChange(line, reference) {
   const distance = getColorDistance(line.backgroundColor, reference.backgroundColor);
   const brightnessA = (line.backgroundColor.red + line.backgroundColor.green + line.backgroundColor.blue) / 3;
   const brightnessB = (reference.backgroundColor.red + reference.backgroundColor.green + reference.backgroundColor.blue) / 3;
-  return distance >= 28 && Math.abs(brightnessA - brightnessB) >= 10;
+  return distance >= 18 && Math.abs(brightnessA - brightnessB) >= 10;
 }
 
 function hasMeaningfulTextColorChange(line, reference) {
@@ -369,20 +534,33 @@ function hasMeaningfulFontChange(line, reference, medianFont = 12) {
   return fontSizeChanged || fontWeightChanged || fontFamilyChanged || fontStyleChanged;
 }
 
-function isLineVisualOutlier(line, pageVisualReference, medianFont = 12) {
-  if (hasMeaningfulBackgroundChange(line, pageVisualReference)) return true;
+function getLineVisualOutlierReasons(line, pageVisualReference, medianFont = 12) {
+  const reasons = [];
   const words = countWords(line.text);
-  if (words <= 16 && hasMeaningfulTextColorChange(line, pageVisualReference)) return true;
-  if (words <= 16 && hasMeaningfulFontChange(line, pageVisualReference, medianFont)) return true;
-  return false;
+  if (hasMeaningfulBackgroundChange(line, pageVisualReference)) reasons.push("background");
+  if (
+    words <= 10
+    && hasMeaningfulTextColorChange(line, pageVisualReference)
+    && ((line.fontWeight || 400) >= 650 || line.fontSize >= medianFont * 1.08)
+  ) reasons.push("text-color");
+  if (words <= 16 && hasMeaningfulFontChange(line, pageVisualReference, medianFont)) reasons.push("font");
+  return reasons;
+}
+
+function isLineVisualOutlier(line, pageVisualReference, medianFont = 12) {
+  return getLineVisualOutlierReasons(line, pageVisualReference, medianFont).length > 0;
 }
 
 function isLineVisualBoundary(line, current, medianFont = 12) {
   if (!current?.lines?.length) return false;
   const currentReference = getLineVisualReference(current.lines);
   if (hasMeaningfulBackgroundChange(line, currentReference)) return true;
-  if (hasMeaningfulTextColorChange(line, currentReference)) return true;
   if (hasMeaningfulFontChange(line, currentReference, medianFont)) return true;
+  if (
+    countWords(line.text) <= 10
+    && hasMeaningfulTextColorChange(line, currentReference)
+    && ((line.fontWeight || 400) >= 650 || line.fontSize >= medianFont * 1.08)
+  ) return true;
   return false;
 }
 
@@ -630,6 +808,43 @@ function isLikelyTableBlock(block) {
   return false;
 }
 
+function summarizeBlockVisualDivergence(block, visualReference, medianFont = 12) {
+  const lines = block.lineBoxes || block.lines || [];
+  if (!lines.length || !visualReference) {
+    return {
+      lineCount: lines.length,
+      backgroundLineCount: 0,
+      textColorLineCount: 0,
+      fontLineCount: 0,
+      backgroundRatio: 0,
+      textColorRatio: 0,
+      fontRatio: 0,
+    };
+  }
+
+  const backgroundLineCount = lines.filter((line) => hasMeaningfulBackgroundChange(line, visualReference)).length;
+  const textColorLineCount = lines.filter((line) => hasMeaningfulTextColorChange(line, visualReference)).length;
+  const fontLineCount = lines.filter((line) => hasMeaningfulFontChange(line, visualReference, medianFont)).length;
+  return {
+    lineCount: lines.length,
+    backgroundLineCount,
+    textColorLineCount,
+    fontLineCount,
+    backgroundRatio: backgroundLineCount / lines.length,
+    textColorRatio: textColorLineCount / lines.length,
+    fontRatio: fontLineCount / lines.length,
+  };
+}
+
+function hasVisualCalloutStyle(block, medianFont = 12) {
+  const divergence = block.visualDivergence
+    || summarizeBlockVisualDivergence(block, block.visualReference, medianFont);
+  if (!divergence.lineCount) return false;
+  if (divergence.backgroundLineCount >= 2 && divergence.backgroundRatio >= 0.2) return true;
+  if (divergence.backgroundLineCount >= 1 && divergence.backgroundRatio >= 0.5) return true;
+  return false;
+}
+
 function median(values) {
   const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
   if (!sorted.length) return 12;
@@ -693,6 +908,27 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber, analysi
         return buildLineFromSpans(run, `p${pageNumber}-l${lineIndex}`, rowLooksTableLike, runs.length);
       });
     });
+
+  const visualSamplingContext = {
+    lines: naturalLines,
+    columns: detectTextColumns(naturalLines, viewport.width, medianFont),
+  };
+
+  if (analysisContext) {
+    naturalLines.forEach((line) => {
+      const visualStyle = sampleLineVisualStyle(
+        analysisContext,
+        line,
+        medianFont,
+        viewport.width,
+        visualSamplingContext,
+      );
+      line.backgroundColor = visualStyle.backgroundColor || line.backgroundColor;
+      line.textColor = visualStyle.textColor || line.textColor;
+      line.sampleBox = visualStyle.sampleBox || line.sampleBox;
+    });
+  }
+
   const lines = sortLinesForReadingOrder(naturalLines, viewport.width, medianFont);
 
   const blocks = [];
@@ -725,12 +961,14 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber, analysi
     current.spanIds = current.lineBoxes.flatMap((line) => line.segments.map((segment) => segment.id));
     current.tableLike = isLikelyTableBlock(current);
     current.kind = current.tableLike ? "table" : classifyBlock(current, medianFont);
+    current.visualReference = pageVisualReference;
+    current.visualDivergence = summarizeBlockVisualDivergence(current, pageVisualReference, medianFont);
     delete current.lines;
     blocks.push(current);
     current = null;
   };
 
-  const pageVisualReference = getLineVisualReference(lines.filter((line) => !line.tableLike));
+  const pageVisualReference = getLineVisualReference(getPageVisualReferenceLines(lines, viewport.width, medianFont));
   const visualDebugLines = [];
   const addVisualDebugLine = (line, status, details = {}) => {
     visualDebugLines.push({
@@ -753,13 +991,20 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber, analysi
   };
 
   lines.forEach((line) => {
-    const boundaryLabel = isBoundaryLabelLine(line, medianFont);
-    const visualOutlier = isLineVisualOutlier(line, pageVisualReference, medianFont);
+    const boundaryReasons = getBoundaryLabelReasons(line, medianFont);
+    const boundaryLabel = boundaryReasons.length > 0;
+    const visualOutlierReasons = getLineVisualOutlierReasons(line, pageVisualReference, medianFont);
+    const visualOutlier = visualOutlierReasons.length > 0;
 
     if (line.tableLike || boundaryLabel || visualOutlier) {
       addVisualDebugLine(line, line.tableLike ? "table" : boundaryLabel ? "boundary-label" : "visual-outlier", {
         boundaryLabel,
         visualOutlier,
+        reasons: [
+          ...(line.tableLike ? ["table-row"] : []),
+          ...boundaryReasons,
+          ...visualOutlierReasons,
+        ],
       });
       flush();
       return;
@@ -812,14 +1057,18 @@ function extractBlocksFromTextContent(textContent, viewport, pageNumber, analysi
   flush();
 
   return {
-    items: blocks.map((block) => ({
-      ...block,
-      x: Math.max(0, block.x - 2),
-      y: Math.max(0, block.y - 2),
-      width: Math.min(viewport.width - block.x, block.width + 6),
-      height: block.height + 4,
-      textLength: block.text.length,
-    })),
+    items: blocks.map((block) => {
+      const item = {
+        ...block,
+        x: Math.max(0, block.x - 2),
+        y: Math.max(0, block.y - 2),
+        width: Math.min(viewport.width - block.x, block.width + 6),
+        height: block.height + 4,
+        textLength: block.text.length,
+      };
+      item.sourceRejectReason = getSourceBlockRejectReason(item);
+      return item;
+    }),
     textSpans: spans,
     debugLines: visualDebugLines,
   };
@@ -893,19 +1142,26 @@ async function uploadPdf(file) {
   state.objectId = uploadData.objectId;
 }
 
-function isReadableSourceBlock(item) {
+function getSourceBlockRejectReason(item) {
   const text = normalizeText(item.text);
   const lines = item.lineBoxes || [];
   const medianFont = Math.max(8, item.fontSize || median(lines.map((line) => line.fontSize)));
-  if (item.kind === "table" || item.tableLike) return false;
-  if (isLikelyHeaderBlock(item)) return false;
-  if (countSentences(text) < 3) return false;
-  if (countWords(text) < 40) return false;
-  if (isPageNumberText(text)) return false;
-  if (numericTokenRatio(text) > 0.45) return false;
-  if (isMostlyShortLabelLines(lines)) return false;
-  if (!hasReasonableLineSpacing(lines, medianFont)) return false;
-  return ["paragraph", "text", "bullet"].includes(item.kind) || countSentences(text) > 0;
+  if (!text) return "empty";
+  if (item.kind === "table" || item.tableLike) return "table-like";
+  if (isLikelyHeaderBlock(item)) return "header-like";
+  if (isPageNumberText(text)) return "page-number";
+  if (hasVisualCalloutStyle(item, medianFont)) return "visual-callout";
+  if (countSentences(text) < 3) return "too-few-sentences";
+  if (countWords(text) < 40) return "too-few-words";
+  if (numericTokenRatio(text) > 0.45) return "numeric-heavy";
+  if (isMostlyShortLabelLines(lines)) return "short-label-lines";
+  if (!hasReasonableLineSpacing(lines, medianFont)) return "irregular-line-spacing";
+  if (!["paragraph", "text", "bullet"].includes(item.kind) && countSentences(text) <= 0) return "unsupported-kind";
+  return "";
+}
+
+function isReadableSourceBlock(item) {
+  return !getSourceBlockRejectReason(item);
 }
 
 function getSourceItems() {
@@ -1917,6 +2173,29 @@ async function loadModelOptions() {
     els.modelMeta.textContent = "Using fallback model list";
   }
 }
+
+function enableExtractionDebugApi() {
+  if (!new URLSearchParams(window.location.search).has("debugExtraction")) return;
+  window.__pdfAnnotatorDebug = {
+    getPages: () => state.pages,
+    getSourceItems: () => getSourceItems(),
+    getRejectSummary: () => state.pages.flatMap((page) => (
+      page.items.map((item) => ({
+        id: item.id,
+        pageNumber: item.pageNumber,
+        kind: item.kind,
+        tableLike: Boolean(item.tableLike),
+        rejectReason: getSourceBlockRejectReason(item),
+        words: countWords(item.text || ""),
+        sentences: countSentences(item.text || ""),
+        lineCount: item.lineBoxes?.length || 0,
+        text: normalizeText(item.text || "").slice(0, 220),
+      }))
+    )),
+  };
+}
+
+enableExtractionDebugApi();
 
 els.input.addEventListener("change", (event) => handleFile(event.target.files[0]));
 els.processButton.addEventListener("click", processCurrentPdf);
