@@ -165,7 +165,7 @@ function isLikelyHeaderBlock(block, medianFont = 12) {
   const fontWeight = Number(block?.fontWeight) || 400;
   const lineCount = block?.lineBoxes?.length || block?.lines?.length || 1;
   const fromOcr = isOcrDerivedText(block);
-  const isEmphasized = fontWeight >= 650 || fontSize >= medianFont * (fromOcr ? 1.35 : 1.12);
+  const isEmphasized = fontWeight >= 650 || (!fromOcr && fontSize >= medianFont * 1.12);
 
   if (/^\d+[.)]?$/.test(text)) return true;
   if (/^page\s+\d+$/i.test(text)) return true;
@@ -247,6 +247,10 @@ function hasLeadingListMarkerShape(text) {
   return /^[^A-Za-z0-9]{1,4}\s*[A-Za-z0-9]/.test(normalizeText(text));
 }
 
+function hasInlineLabelCalloutShape(text) {
+  return /^[A-Z][^.!?]{2,36}:\s+\S/.test(normalizeText(text));
+}
+
 function getBoundaryLabelReasons(line, medianFont = 12) {
   const text = normalizeText(line.text);
   const reasons = [];
@@ -255,6 +259,7 @@ function getBoundaryLabelReasons(line, medianFont = 12) {
 
   const words = countWords(text);
   const sentenceCount = countSentences(text);
+  if (hasInlineLabelCalloutShape(text) && words <= 22) reasons.push("inline-label");
   if (words <= 10 && sentenceCount === 0 && /:$/.test(text)) reasons.push("punctuated-label");
   if (isLikelyHeaderBlock(line, medianFont)) reasons.push("header-like");
   return reasons;
@@ -605,7 +610,8 @@ function getLineVisualOutlierReasons(line, pageVisualReference, medianFont = 12)
     || line.fontSize >= medianFont * (fromOcr ? 1.35 : 1.08);
   if (hasMeaningfulBackgroundChange(line, pageVisualReference)) reasons.push("background");
   if (
-    words <= 10
+    !fromOcr
+    && words <= 10
     && hasMeaningfulTextColorChange(line, pageVisualReference)
     && visuallyEmphasized
   ) reasons.push("text-color");
@@ -624,7 +630,8 @@ function isLineVisualBoundary(line, current, medianFont = 12) {
   if (hasMeaningfulBackgroundChange(line, currentReference)) return true;
   if (!fromOcr && hasMeaningfulFontChange(line, currentReference, medianFont)) return true;
   if (
-    countWords(line.text) <= 10
+    !fromOcr
+    && countWords(line.text) <= 10
     && hasMeaningfulTextColorChange(line, currentReference)
     && ((line.fontWeight || 400) >= 650 || line.fontSize >= medianFont * (fromOcr ? 1.35 : 1.08))
   ) return true;
@@ -1446,20 +1453,66 @@ function mapOcrWordsToOriginalCanvas(words, deskewTransform = null) {
   })).filter((word) => word.box.width > 0 && word.box.height > 0);
 }
 
-function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analysisContext = null, deskewTransform = null) {
+function mapOcrRectToViewport(rect, viewport, ocrViewport, deskewTransform = null) {
+  const sourceRect = deskewTransform
+    ? mapRectFromDeskewedToOriginal(rect, deskewTransform)
+    : rect;
   const scaleX = viewport.width / Math.max(1, ocrViewport.width);
   const scaleY = viewport.height / Math.max(1, ocrViewport.height);
-  const normalizedWords = mapOcrWordsToOriginalCanvas(words, deskewTransform);
+  return {
+    x: sourceRect.left * scaleX,
+    y: sourceRect.top * scaleY,
+    width: sourceRect.width * scaleX,
+    height: sourceRect.height * scaleY,
+  };
+}
 
-  const spans = normalizedWords
+function mapOcrSpanToViewport(span, viewport, ocrViewport, analysisContext = null, deskewTransform = null) {
+  const rect = mapOcrRectToViewport({
+    left: span.x,
+    top: span.y,
+    width: span.width,
+    height: span.height,
+  }, viewport, ocrViewport, deskewTransform);
+  const fontSize = Math.max(8, rect.height * 0.78);
+  const visualStyle = sampleTextVisualStyle(analysisContext, rect);
+  return {
+    ...span,
+    x: rect.x,
+    y: rect.y,
+    baselineY: rect.y + rect.height * 0.82,
+    width: rect.width,
+    height: rect.height,
+    fontSize,
+    backgroundColor: visualStyle.backgroundColor,
+    textColor: visualStyle.textColor,
+    sampleBox: visualStyle.sampleBox,
+  };
+}
+
+function mapOcrLineToViewport(line, viewport, ocrViewport, analysisContext = null, deskewTransform = null) {
+  const mappedSegments = line.segments.map((segment) => mapOcrSpanToViewport(
+    segment,
+    viewport,
+    ocrViewport,
+    analysisContext,
+    deskewTransform,
+  ));
+  return buildLineFromSpans(mappedSegments, line.id, line.tableLike, line.rowRunCount);
+}
+
+function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analysisContext = null, deskewTransform = null) {
+  const workingPageWidth = deskewTransform?.outputWidth || ocrViewport.width;
+  const workingWords = words;
+
+  const workingSpans = workingWords
     .filter((word) => !Number.isFinite(word.confidence) || word.confidence >= 25)
     .map((word, index) => {
-      const x = word.box.left * scaleX;
-      const y = word.box.top * scaleY;
-      const width = word.box.width * scaleX;
-      const height = word.box.height * scaleY;
+      const x = word.box.left;
+      const y = word.box.top;
+      const width = word.box.width;
+      const height = word.box.height;
       const fontSize = Math.max(8, height * 0.78);
-      const visualStyle = sampleTextVisualStyle(analysisContext, { x, y, width, height });
       return {
         id: `p${pageNumber}-ocr-s${index}`,
         text: word.text,
@@ -1474,24 +1527,24 @@ function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analys
         fontStyle: "normal",
         fontWeight: 400,
         fromOcr: true,
-        backgroundColor: visualStyle.backgroundColor,
-        textColor: visualStyle.textColor,
-        sampleBox: visualStyle.sampleBox,
+        backgroundColor: null,
+        textColor: null,
+        sampleBox: null,
         textLength: word.text.length,
       };
     })
     .filter((span) => span.text && span.width > 0 && span.height > 0);
 
-  const medianFont = median(spans.map((span) => span.fontSize));
+  const workingMedianFont = median(workingSpans.map((span) => span.fontSize));
   const lineBuckets = [];
 
-  [...spans].sort((a, b) => a.y - b.y || a.x - b.x).forEach((span) => {
+  [...workingSpans].sort((a, b) => a.y - b.y || a.x - b.x).forEach((span) => {
     const centerY = span.y + span.height / 2;
     let bestBucket = null;
     let bestDistance = Infinity;
     lineBuckets.forEach((bucket) => {
       const distance = Math.abs(centerY - bucket.centerY);
-      const threshold = Math.max(medianFont * 0.72, Math.min(bucket.height, span.height) * 0.8);
+      const threshold = Math.max(workingMedianFont * 0.72, Math.min(bucket.height, span.height) * 0.8);
       if (distance <= threshold && distance < bestDistance) {
         bestBucket = bucket;
         bestDistance = distance;
@@ -1513,11 +1566,11 @@ function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analys
   });
 
   let lineIndex = 0;
-  const lines = lineBuckets
+  const workingLines = lineBuckets
     .sort((a, b) => a.centerY - b.centerY)
     .flatMap((bucket) => {
       const ordered = bucket.spans.sort((a, b) => a.x - b.x);
-      const runs = splitLineSpansIntoRuns(ordered, medianFont, viewport.width);
+      const runs = splitLineSpansIntoRuns(ordered, workingMedianFont, workingPageWidth);
       const rowText = normalizeText(ordered.map((span) => span.text).join(" "));
       const rowLooksTableLike = isLikelyTableRow(runs, rowText);
       return runs.map((run) => {
@@ -1525,6 +1578,9 @@ function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analys
         return buildLineFromSpans(run, `p${pageNumber}-ocr-l${lineIndex}`, rowLooksTableLike, runs.length);
       });
     });
+  const spans = workingSpans.map((span) => mapOcrSpanToViewport(span, viewport, ocrViewport, analysisContext, deskewTransform));
+  const lines = workingLines.map((line) => mapOcrLineToViewport(line, viewport, ocrViewport, analysisContext, deskewTransform));
+  const medianFont = median(lines.map((line) => line.fontSize));
 
   if (analysisContext) {
     const samplingContext = {
@@ -1543,16 +1599,29 @@ function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analys
   return { spans, lines, medianFont };
 }
 
-function normalizeOcrLineText(line) {
-  const text = normalizeText(line.text);
-  if (!text) return "";
-  if (/[.!?]$/.test(text)) return text;
-  if (countWords(text) >= 6) return `${text}.`;
-  return text;
+function shouldMergeOcrLineBreak(previousText, nextText) {
+  const previous = normalizeText(previousText);
+  const next = normalizeText(nextText);
+  if (!previous || !next) return false;
+  if (/^[a-z(]/.test(next)) return true;
+  return /\b(the|a|an|of|and|or|to|with|for|in|on|by|from|as|that|which|because|but|it)$/i.test(previous.replace(/[.!?]+$/, ""));
+}
+
+function normalizeOcrBlockText(lines) {
+  const parts = [];
+  lines.forEach((line) => {
+    const text = normalizeText(line.text);
+    if (!text) return;
+    if (parts.length && shouldMergeOcrLineBreak(parts[parts.length - 1], text)) {
+      parts[parts.length - 1] = parts[parts.length - 1].replace(/[.!?]+$/, "");
+    }
+    parts.push(text);
+  });
+  return normalizeText(parts.join(" "));
 }
 
 function makeBlockFromLines(lines, id, pageNumber, viewport, medianFont, pageVisualReference) {
-  const text = normalizeText(lines.map(normalizeOcrLineText).join(" "));
+  const text = normalizeOcrBlockText(lines);
   const x = Math.min(...lines.map((line) => line.x));
   const y = Math.min(...lines.map((line) => line.y));
   const right = Math.max(...lines.map((line) => line.x + line.width));
@@ -1590,6 +1659,7 @@ function makeBlockFromLines(lines, id, pageNumber, viewport, medianFont, pageVis
       rowRunCount: line.rowRunCount || 1,
       segments: line.segments,
     })),
+    sourceLines: lines.map((line) => line.text),
     visualReference: pageVisualReference,
   };
 
@@ -1859,18 +1929,18 @@ function getSourceBlockRejectReason(item) {
   const wordCount = countWords(text);
   const sentenceCount = countSentences(text);
   const ocrParagraphLike = Boolean(item.fromOcr)
-    && wordCount >= 55
-    && lines.length >= 4
-    && wordCount / Math.max(1, lines.length) >= 7;
+    && wordCount >= 40
+    && lines.length >= 3
+    && wordCount / Math.max(1, lines.length) >= 5;
   if (!text) return "empty";
   if (item.kind === "table" || item.tableLike) return "table-like";
   if (isLikelyHeaderBlock(item)) return "header-like";
   if (isPageNumberText(text)) return "page-number";
   if (hasVisualCalloutStyle(item, medianFont)) return "visual-callout";
+  if (isMostlyShortLabelLines(lines)) return "short-label-lines";
   if (sentenceCount < 3 && !ocrParagraphLike) return "too-few-sentences";
   if (wordCount < 40) return "too-few-words";
   if (numericTokenRatio(text) > 0.45) return "numeric-heavy";
-  if (isMostlyShortLabelLines(lines)) return "short-label-lines";
   if (!hasReasonableLineSpacing(lines, medianFont)) return "irregular-line-spacing";
   if (!["paragraph", "text", "bullet"].includes(item.kind) && sentenceCount <= 0) return "unsupported-kind";
   return "";
@@ -1896,6 +1966,8 @@ function buildArticlePayload() {
     order: index,
     pageNumber: item.pageNumber,
     kind: item.kind,
+    fromOcr: Boolean(item.fromOcr),
+    sourceLines: item.fromOcr ? (item.sourceLines || item.lineBoxes?.map((line) => line.text) || []) : [],
     text: item.text,
   }));
 
@@ -2568,7 +2640,11 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
           ? Math.max(9, Math.min(baseHeaderFontSize, rowHeight * 0.72))
           : Math.max(8, Math.min(baseBulletFontSize, rowHeight * 0.64));
         const indent = annotation.kind === "bullet" ? Math.max(8, fittedFontSize * 0.85) : 0;
-        const lineX = Math.max(regionLeft, Math.min(line.x || regionLeft, rightEdge - 24));
+        const noisyOcrLineStart = source.fromOcr
+          && (annotation.kind === "header" || Math.abs((line.x || regionLeft) - regionLeft) > Math.max(fontSize * 8, sourceRegion.width * 0.28));
+        const lineX = noisyOcrLineStart
+          ? regionLeft
+          : Math.max(regionLeft, Math.min(line.x || regionLeft, rightEdge - 24));
         const rowX = Math.max(regionLeft, Math.min(lineX + indent, rightEdge - 24));
         const centerX = regionLeft + Math.max(24, rightEdge - regionLeft) / 2;
         const x = isPairedBullet && rowItemIndex === 1 ? Math.max(centerX, rowX) : rowX;

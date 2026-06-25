@@ -138,6 +138,14 @@ function sourceBlockSentences(sourceBlocks) {
   return sentences;
 }
 
+function hasEnoughSourceSentences(block) {
+  const sourceSentences = splitIntoSentences(block.text).filter((sentence) => !isLikelyHeaderBlock(sentence));
+  if (block.fromOcr) {
+    return sourceSentences.length >= 1 && countWords(block.text) >= MIN_SOURCE_WORDS;
+  }
+  return sourceSentences.length >= MIN_SOURCE_SENTENCES;
+}
+
 function normalizeArticles(rawArticles) {
   return asArray(rawArticles).map((article, articleIndex) => {
     const sourceBlocks = asArray(article.sourceBlocks)
@@ -147,10 +155,12 @@ function normalizeArticles(rawArticles) {
         order: Number.isFinite(block.order) ? block.order : blockIndex,
         pageNumber: Number.isFinite(block.pageNumber) ? block.pageNumber : null,
         kind: String(block.kind || "text"),
+        fromOcr: Boolean(block.fromOcr),
+        sourceLines: asArray(block.sourceLines).map(normalizeText).filter(Boolean),
         text: normalizeText(block.text),
       }))
       .filter((block) => !isLikelyHeaderBlock(block.text))
-      .filter((block) => splitIntoSentences(block.text).filter((sentence) => !isLikelyHeaderBlock(sentence)).length >= MIN_SOURCE_SENTENCES)
+      .filter(hasEnoughSourceSentences)
       .filter((block) => countWords(block.text) >= MIN_SOURCE_WORDS);
 
     const sentences = sourceBlockSentences(sourceBlocks);
@@ -256,6 +266,25 @@ function textForIndexes(article, indexes) {
   return indexes.map((index) => byIndex.get(index)?.text).filter(Boolean).join(" ");
 }
 
+function sourceRunsForIndexes(article, indexes) {
+  const byIndex = new Map(article.sentences.map((sentence) => [sentence.index, sentence]));
+  const runs = [];
+  indexes.forEach((index) => {
+    const sentence = byIndex.get(index);
+    if (!sentence?.sourceBlockId) return;
+    const current = runs[runs.length - 1];
+    if (current?.sourceBlockId === sentence.sourceBlockId) {
+      current.indexes.push(index);
+      return;
+    }
+    runs.push({
+      sourceBlockId: sentence.sourceBlockId,
+      indexes: [index],
+    });
+  });
+  return runs;
+}
+
 function addCoverage(coverage, indexes, validIndexes, label) {
   indexes.forEach((index) => {
     if (!validIndexes.has(index)) throw new Error(`${label} references missing sentence ${index}`);
@@ -307,7 +336,7 @@ function normalizeModelResult(parsed, title, inputArticles) {
       addCoverage(sectionCoverage, sectionIndexes, validIndexes, `section ${sectionIndex + 1}`);
 
       const sectionBulletCoverage = new Set();
-      const blocks = bulletsFromSectionResult(section).map((bullet, bulletIndex) => {
+      const blocks = bulletsFromSectionResult(section).flatMap((bullet, bulletIndex) => {
         const bulletRange = rangeFromValue(rangeValueFromResult(bullet), `section ${sectionIndex + 1} bullet ${bulletIndex + 1}`);
         if (!rangeInside(bulletRange, sectionRange)) {
           throw new Error(`section ${sectionIndex + 1} bullet ${bulletIndex + 1} is outside its section range`);
@@ -318,18 +347,24 @@ function normalizeModelResult(parsed, title, inputArticles) {
         addCoverage(bulletCoverage, bulletIndexes, validIndexes, `article ${articleIndex + 1} bullet coverage`);
 
         const sourceBlockIds = uniqueSourceIdsForIndexes(inputArticle, bulletIndexes);
-        const sourceText = textForIndexes(inputArticle, bulletIndexes);
         const bulletLabel = shortLabel(bullet.bullet || bullet.label || bullet.l || `Point ${bulletIndex + 1}`);
-        if (!sourceBlockIds.length || !sourceText || !bulletLabel) return null;
+        if (!sourceBlockIds.length || !bulletLabel) return [];
 
-        totalBlocks += 1;
-        return {
-          blockId: String(bullet.blockId || bullet.id || `${inputArticle.articleId}-s${sectionIndex + 1}-b${bulletIndex + 1}`),
-          bullet: bulletLabel,
-          sourceBlockIds,
-          sourceText,
-          sentenceRange: [bulletRange.start, bulletRange.end],
-        };
+        const sourceRuns = sourceRunsForIndexes(inputArticle, bulletIndexes);
+        return sourceRuns.map((run, runIndex) => {
+          const sourceText = textForIndexes(inputArticle, run.indexes);
+          if (!sourceText) return null;
+          totalBlocks += 1;
+          const suffix = sourceRuns.length > 1 ? `-part-${runIndex + 1}` : "";
+          return {
+            blockId: String(bullet.blockId || bullet.id || `${inputArticle.articleId}-s${sectionIndex + 1}-b${bulletIndex + 1}`) + suffix,
+            bullet: bulletLabel,
+            sourceBlockIds: [run.sourceBlockId],
+            sourceText,
+            sentenceRange: [run.indexes[0], run.indexes[run.indexes.length - 1]],
+            continuedFromRange: sourceRuns.length > 1 ? [bulletRange.start, bulletRange.end] : undefined,
+          };
+        }).filter(Boolean);
       }).filter(Boolean);
 
       ensureCovered(sectionIndexes, sectionBulletCoverage, `section ${sectionIndex + 1} bullets`);

@@ -173,6 +173,76 @@ test("valid sentence ranges rebuild exact source text", async () => {
   assert.equal(secondSection.blocks[1].sourceText, SENTENCES[4]);
 });
 
+test("bullet ranges crossing source blocks are split into separate source links", async () => {
+  const firstBlockSentences = [
+    "First page paragraphs can continue a thought through several sentences while still belonging to the same explanation in the original document.",
+    "The first source block still has enough sentence structure and enough words to pass the backend readability filter.",
+    "A final sentence on the first block may lead into the next page without losing its connection to the previous idea.",
+  ];
+  const secondBlockSentences = [
+    "The next source block may continue the same topic after a page boundary while occupying a different clickable region.",
+    "Clickable popovers should not mix text from different page regions because that makes the source window misleading.",
+    "Separate links keep each annotation anchored to its own source block while preserving the validated sentence coverage.",
+  ];
+  mockAiResult({
+    d: "Cross Block Test",
+    a: [
+      {
+        id: "pdf-article-1",
+        t: "Cross Block Test",
+        sec: [
+          {
+            t: "Cross Block Handling",
+            r: [1, 6],
+            b: [
+              { l: "First block setup", r: [1, 2] },
+              { l: "Boundary continuation", r: [3, 4] },
+              { l: "Separate source links", r: [5, 6] },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+
+  const response = await handler(requestWithJson(sourcePayload({
+    title: "Cross Block Test",
+    articles: [
+      {
+        articleId: "pdf-article-1",
+        title: "Cross Block Test",
+        sourceBlocks: [
+          {
+            id: "block-1",
+            order: 0,
+            pageNumber: 1,
+            kind: "paragraph",
+            text: firstBlockSentences.join(" "),
+          },
+          {
+            id: "block-2",
+            order: 1,
+            pageNumber: 2,
+            kind: "paragraph",
+            text: secondBlockSentences.join(" "),
+          },
+        ],
+      },
+    ],
+  })), TEST_CONTEXT);
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.stats.blocks, 4);
+  const blocks = body.articles[0].sections[0].blocks;
+  assert.deepEqual(blocks[1].sourceBlockIds, ["block-1"]);
+  assert.deepEqual(blocks[1].sentenceRange, [3, 3]);
+  assert.equal(blocks[1].sourceText, firstBlockSentences[2]);
+  assert.deepEqual(blocks[2].sourceBlockIds, ["block-2"]);
+  assert.deepEqual(blocks[2].sentenceRange, [4, 4]);
+  assert.equal(blocks[2].sourceText, secondBlockSentences[0]);
+});
+
 test("overlapping bullet ranges are rejected", async () => {
   mockAiResult({
     d: "Contract Test",
