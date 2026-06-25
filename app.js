@@ -6,6 +6,12 @@ const MAX_PDF_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL = "openai/gpt-4.1-mini";
 const OCR_MAX_SCANNED_PAGES = 5;
 const OCR_RENDER_SCALE = 2.4;
+const OCR_DESKEW_MAX_ANGLE = 8;
+const OCR_DESKEW_COARSE_STEP = 0.5;
+const OCR_DESKEW_FINE_STEP = 0.1;
+const OCR_DESKEW_MIN_APPLY_ANGLE = 0.3;
+const OCR_DESKEW_MIN_CONFIDENCE = 0.015;
+const OCR_DESKEW_SAMPLE_WIDTH = 640;
 const SCANNED_SELECTABLE_WORD_LIMIT = 18;
 const SCANNED_SOURCE_BLOCK_LIMIT = 0;
 
@@ -158,15 +164,26 @@ function isLikelyHeaderBlock(block, medianFont = 12) {
   const fontSize = Number(block?.fontSize) || medianFont;
   const fontWeight = Number(block?.fontWeight) || 400;
   const lineCount = block?.lineBoxes?.length || block?.lines?.length || 1;
-  const isEmphasized = fontSize >= medianFont * 1.12 || fontWeight >= 650;
+  const fromOcr = isOcrDerivedText(block);
+  const isEmphasized = fontWeight >= 650 || fontSize >= medianFont * (fromOcr ? 1.35 : 1.12);
 
   if (/^\d+[.)]?$/.test(text)) return true;
   if (/^page\s+\d+$/i.test(text)) return true;
+  if (words <= 12 && sentenceCount <= 1 && /^\d+(?:\.\d+)*[.)]?\s+\S/.test(text)) return true;
   if (words <= 10 && /:$/.test(text)) return true;
   if (words <= 7 && sentenceCount <= 1 && isTitleCaseLike(text) && !/,/.test(text)) return true;
   if (words <= 9 && sentenceCount === 0 && isTitleCaseLike(text)) return true;
   if (words <= 12 && sentenceCount <= 1 && lineCount <= 2 && isEmphasized) return true;
   return false;
+}
+
+function isOcrDerivedText(item) {
+  if (!item || typeof item === "string") return false;
+  if (item.fromOcr || item.fontName === "OCR") return true;
+  const lines = item.lineBoxes || item.lines || [];
+  if (lines.some((line) => line.fromOcr || line.fontName === "OCR")) return true;
+  const segments = item.segments || [];
+  return segments.some((segment) => segment.fromOcr || segment.fontName === "OCR");
 }
 
 function getFontSize(item) {
@@ -226,6 +243,10 @@ function isBoundaryLabelLine(line, medianFont = 12) {
   return getBoundaryLabelReasons(line, medianFont).length > 0;
 }
 
+function hasLeadingListMarkerShape(text) {
+  return /^[^A-Za-z0-9]{1,4}\s*[A-Za-z0-9]/.test(normalizeText(text));
+}
+
 function getBoundaryLabelReasons(line, medianFont = 12) {
   const text = normalizeText(line.text);
   const reasons = [];
@@ -244,7 +265,8 @@ function isMostlyShortLabelLines(lines) {
   const shortLabelLines = lines.filter((line) => {
     const text = normalizeText(line.text);
     const words = countWords(text);
-    return words <= 8 && (countSentences(text) === 0 || isTitleCaseLike(text) || /:$/.test(text));
+    return (words <= 8 && (countSentences(text) === 0 || isTitleCaseLike(text) || /:$/.test(text)))
+      || (hasLeadingListMarkerShape(text) && words <= 12);
   }).length;
   const averageWordsPerLine = lines.reduce((total, line) => total + countWords(line.text), 0) / Math.max(1, lines.length);
   return lines.length >= 3 && shortLabelLines / lines.length >= 0.55 && averageWordsPerLine <= 9;
@@ -272,7 +294,7 @@ function isStrongParagraphReferenceLine(line, medianFont = 12, pageWidth = 0) {
   const words = countWords(text);
   const sentenceCount = countSentences(text);
   const fontSize = Math.max(8, line.fontSize || medianFont);
-  const normalFontSize = Math.abs(fontSize - medianFont) <= Math.max(2.2, medianFont * 0.22);
+  const normalFontSize = isOcrDerivedText(line) || Math.abs(fontSize - medianFont) <= Math.max(2.2, medianFont * 0.22);
   const normalWeight = (line.fontWeight || 400) < 650;
   const enoughText = words >= 7 || text.length >= 52 || (words >= 5 && sentenceCount > 0);
   const enoughWidth = line.width >= Math.max(medianFont * 10, (pageWidth || 0) * 0.12);
@@ -578,13 +600,16 @@ function hasMeaningfulFontChange(line, reference, medianFont = 12) {
 function getLineVisualOutlierReasons(line, pageVisualReference, medianFont = 12) {
   const reasons = [];
   const words = countWords(line.text);
+  const fromOcr = isOcrDerivedText(line);
+  const visuallyEmphasized = (line.fontWeight || 400) >= 650
+    || line.fontSize >= medianFont * (fromOcr ? 1.35 : 1.08);
   if (hasMeaningfulBackgroundChange(line, pageVisualReference)) reasons.push("background");
   if (
     words <= 10
     && hasMeaningfulTextColorChange(line, pageVisualReference)
-    && ((line.fontWeight || 400) >= 650 || line.fontSize >= medianFont * 1.08)
+    && visuallyEmphasized
   ) reasons.push("text-color");
-  if (words <= 16 && hasMeaningfulFontChange(line, pageVisualReference, medianFont)) reasons.push("font");
+  if (!fromOcr && words <= 16 && hasMeaningfulFontChange(line, pageVisualReference, medianFont)) reasons.push("font");
   return reasons;
 }
 
@@ -594,13 +619,14 @@ function isLineVisualOutlier(line, pageVisualReference, medianFont = 12) {
 
 function isLineVisualBoundary(line, current, medianFont = 12) {
   if (!current?.lines?.length) return false;
+  const fromOcr = isOcrDerivedText(line);
   const currentReference = getLineVisualReference(current.lines);
   if (hasMeaningfulBackgroundChange(line, currentReference)) return true;
-  if (hasMeaningfulFontChange(line, currentReference, medianFont)) return true;
+  if (!fromOcr && hasMeaningfulFontChange(line, currentReference, medianFont)) return true;
   if (
     countWords(line.text) <= 10
     && hasMeaningfulTextColorChange(line, currentReference)
-    && ((line.fontWeight || 400) >= 650 || line.fontSize >= medianFont * 1.08)
+    && ((line.fontWeight || 400) >= 650 || line.fontSize >= medianFont * (fromOcr ? 1.35 : 1.08))
   ) return true;
   return false;
 }
@@ -659,6 +685,7 @@ function buildLineFromSpans(ordered, id, tableLike, rowRunCount) {
     fontFamily: getDominantValue(ordered.map((span) => span.fontFamily)),
     fontName: getDominantValue(ordered.map((span) => span.fontName)),
     fontStyle: getDominantValue(ordered.map((span) => span.fontStyle)),
+    fromOcr: ordered.some((span) => span.fromOcr || span.fontName === "OCR"),
     backgroundColor: getDominantColor(ordered.map((span) => span.backgroundColor)),
     textColor: getDominantColor(ordered.map((span) => span.textColor)),
     sampleBox: getUnionRect(ordered.map((span) => span.sampleBox)),
@@ -678,6 +705,7 @@ function buildLineFromSpans(ordered, id, tableLike, rowRunCount) {
       fontName: span.fontName,
       fontStyle: span.fontStyle,
       fontWeight: span.fontWeight,
+      fromOcr: span.fromOcr || span.fontName === "OCR",
       backgroundColor: span.backgroundColor,
       textColor: span.textColor,
       sampleBox: span.sampleBox,
@@ -699,10 +727,11 @@ function getCurrentBlockText(current) {
 
 function classifyBlock(block, medianFont) {
   const text = block.text.trim();
+  const fromOcr = isOcrDerivedText(block);
   if (isLikelyHeaderBlock(block, medianFont)) return block.fontSize >= medianFont * 1.35 ? "title" : "header";
   if (/^(\u2022|[-*]|[0-9]+[.)])\s+/.test(text)) return "bullet";
-  if (block.fontSize >= medianFont * 1.35 && text.length < 120) return "title";
-  if (block.fontSize >= medianFont * 1.12 && text.length < 140) return "header";
+  if (!fromOcr && block.fontSize >= medianFont * 1.35 && text.length < 120) return "title";
+  if (!fromOcr && block.fontSize >= medianFont * 1.12 && text.length < 140) return "header";
   if (countSentences(text) > 2 && text.length > 180) return "paragraph";
   return "text";
 }
@@ -1214,11 +1243,215 @@ function collectOcrWords(data) {
   return parseOcrTsv(data?.tsv);
 }
 
-function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analysisContext = null) {
+function getOtsuThresholdFromImageData(imageData) {
+  const histogram = new Uint32Array(256);
+  const pixels = imageData.data;
+  let total = 0;
+  let weightedTotal = 0;
+
+  for (let index = 0; index < pixels.length; index += 4) {
+    const luminance = Math.round((pixels[index] * 0.299) + (pixels[index + 1] * 0.587) + (pixels[index + 2] * 0.114));
+    histogram[luminance] += 1;
+    total += 1;
+    weightedTotal += luminance;
+  }
+
+  let backgroundWeight = 0;
+  let backgroundSum = 0;
+  let bestVariance = -1;
+  let threshold = 180;
+
+  for (let value = 0; value < 256; value += 1) {
+    backgroundWeight += histogram[value];
+    if (!backgroundWeight) continue;
+    const foregroundWeight = total - backgroundWeight;
+    if (!foregroundWeight) break;
+
+    backgroundSum += value * histogram[value];
+    const backgroundMean = backgroundSum / backgroundWeight;
+    const foregroundMean = (weightedTotal - backgroundSum) / foregroundWeight;
+    const variance = backgroundWeight * foregroundWeight * (backgroundMean - foregroundMean) ** 2;
+    if (variance > bestVariance) {
+      bestVariance = variance;
+      threshold = value;
+    }
+  }
+
+  return Math.max(90, Math.min(220, threshold));
+}
+
+function collectDeskewInkPoints(canvas) {
+  const scale = Math.min(1, OCR_DESKEW_SAMPLE_WIDTH / Math.max(canvas.width, canvas.height));
+  const width = Math.max(1, Math.round(canvas.width * scale));
+  const height = Math.max(1, Math.round(canvas.height * scale));
+  const sampleCanvas = document.createElement("canvas");
+  sampleCanvas.width = width;
+  sampleCanvas.height = height;
+  const ctx = sampleCanvas.getContext("2d", { willReadFrequently: true }) || sampleCanvas.getContext("2d");
+  if (!ctx) return null;
+
+  ctx.drawImage(canvas, 0, 0, width, height);
+  const imageData = ctx.getImageData(0, 0, width, height);
+  const threshold = getOtsuThresholdFromImageData(imageData);
+  const pixels = imageData.data;
+  const points = [];
+  const marginX = Math.max(4, Math.floor(width * 0.025));
+  const marginY = Math.max(4, Math.floor(height * 0.025));
+  const stride = Math.max(1, Math.round(Math.max(width, height) / 700));
+
+  for (let y = marginY; y < height - marginY; y += stride) {
+    for (let x = marginX; x < width - marginX; x += stride) {
+      const index = ((y * width) + x) * 4;
+      const luminance = (pixels[index] * 0.299) + (pixels[index + 1] * 0.587) + (pixels[index + 2] * 0.114);
+      if (luminance < threshold - 8) points.push({ x, y });
+    }
+  }
+
+  if (points.length < 240) return null;
+  return { points, width, height, scale };
+}
+
+function getProjectionScoreForAngle(sample, angleDegrees) {
+  const radians = angleDegrees * Math.PI / 180;
+  const sin = Math.sin(radians);
+  const cos = Math.cos(radians);
+  const centerX = sample.width / 2;
+  const centerY = sample.height / 2;
+  const rows = new Uint16Array(Math.ceil(sample.height * 1.3) + 16);
+  const rowOffset = Math.floor((rows.length - sample.height) / 2);
+
+  sample.points.forEach((point) => {
+    const rotatedY = ((point.x - centerX) * sin) + ((point.y - centerY) * cos) + centerY;
+    const row = Math.round(rotatedY) + rowOffset;
+    if (row >= 0 && row < rows.length) rows[row] += 1;
+  });
+
+  let score = 0;
+  for (let index = 1; index < rows.length - 1; index += 1) {
+    const smoothed = rows[index - 1] + rows[index] * 2 + rows[index + 1];
+    score += smoothed * smoothed;
+  }
+  return score / Math.max(1, sample.points.length);
+}
+
+function scanProjectionAngles(sample, startAngle, endAngle, step) {
+  let best = { angle: 0, score: -Infinity };
+  for (let angle = startAngle; angle <= endAngle + step / 2; angle += step) {
+    const roundedAngle = Math.round(angle * 1000) / 1000;
+    const score = getProjectionScoreForAngle(sample, roundedAngle);
+    if (score > best.score) best = { angle: roundedAngle, score };
+  }
+  return best;
+}
+
+function estimateDeskewByProjection(canvas) {
+  const sample = collectDeskewInkPoints(canvas);
+  if (!sample) {
+    return {
+      angle: 0,
+      confidence: 0,
+      applied: false,
+      reason: "not-enough-ink",
+    };
+  }
+
+  const zeroScore = getProjectionScoreForAngle(sample, 0);
+  const coarse = scanProjectionAngles(sample, -OCR_DESKEW_MAX_ANGLE, OCR_DESKEW_MAX_ANGLE, OCR_DESKEW_COARSE_STEP);
+  const fineStart = Math.max(-OCR_DESKEW_MAX_ANGLE, coarse.angle - OCR_DESKEW_COARSE_STEP);
+  const fineEnd = Math.min(OCR_DESKEW_MAX_ANGLE, coarse.angle + OCR_DESKEW_COARSE_STEP);
+  const fine = scanProjectionAngles(sample, fineStart, fineEnd, OCR_DESKEW_FINE_STEP);
+  const confidence = (fine.score - zeroScore) / Math.max(1, zeroScore);
+  const applied = Math.abs(fine.angle) >= OCR_DESKEW_MIN_APPLY_ANGLE && confidence >= OCR_DESKEW_MIN_CONFIDENCE;
+
+  return {
+    angle: applied ? fine.angle : 0,
+    detectedAngle: fine.angle,
+    confidence,
+    applied,
+    zeroScore,
+    bestScore: fine.score,
+    sampleScale: sample.scale,
+    inkPointCount: sample.points.length,
+    reason: applied ? "applied" : "below-threshold",
+  };
+}
+
+function deskewCanvasByAngle(canvas, angleDegrees) {
+  const radians = angleDegrees * Math.PI / 180;
+  const sin = Math.sin(radians);
+  const cos = Math.cos(radians);
+  const width = canvas.width;
+  const height = canvas.height;
+  const outputWidth = Math.ceil(Math.abs(width * cos) + Math.abs(height * sin));
+  const outputHeight = Math.ceil(Math.abs(width * sin) + Math.abs(height * cos));
+  const deskewed = document.createElement("canvas");
+  deskewed.width = outputWidth;
+  deskewed.height = outputHeight;
+  const ctx = deskewed.getContext("2d", { willReadFrequently: true }) || deskewed.getContext("2d");
+  if (!ctx) return null;
+
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, outputWidth, outputHeight);
+  ctx.translate(outputWidth / 2, outputHeight / 2);
+  ctx.rotate(radians);
+  ctx.drawImage(canvas, -width / 2, -height / 2);
+
+  return {
+    canvas: deskewed,
+    angle: angleDegrees,
+    sourceWidth: width,
+    sourceHeight: height,
+    outputWidth,
+    outputHeight,
+    sin,
+    cos,
+  };
+}
+
+function mapPointFromDeskewedToOriginal(point, transform) {
+  const x = point.x - transform.outputWidth / 2;
+  const y = point.y - transform.outputHeight / 2;
+  return {
+    x: (x * transform.cos) + (y * transform.sin) + transform.sourceWidth / 2,
+    y: (-x * transform.sin) + (y * transform.cos) + transform.sourceHeight / 2,
+  };
+}
+
+function mapRectFromDeskewedToOriginal(rect, transform) {
+  if (!transform) return rect;
+  const corners = [
+    { x: rect.left, y: rect.top },
+    { x: rect.left + rect.width, y: rect.top },
+    { x: rect.left + rect.width, y: rect.top + rect.height },
+    { x: rect.left, y: rect.top + rect.height },
+  ].map((corner) => mapPointFromDeskewedToOriginal(corner, transform));
+
+  const left = Math.max(0, Math.min(...corners.map((corner) => corner.x)));
+  const top = Math.max(0, Math.min(...corners.map((corner) => corner.y)));
+  const right = Math.min(transform.sourceWidth, Math.max(...corners.map((corner) => corner.x)));
+  const bottom = Math.min(transform.sourceHeight, Math.max(...corners.map((corner) => corner.y)));
+  return {
+    left,
+    top,
+    width: Math.max(0, right - left),
+    height: Math.max(0, bottom - top),
+  };
+}
+
+function mapOcrWordsToOriginalCanvas(words, deskewTransform = null) {
+  if (!deskewTransform) return words;
+  return words.map((word) => ({
+    ...word,
+    box: mapRectFromDeskewedToOriginal(word.box, deskewTransform),
+  })).filter((word) => word.box.width > 0 && word.box.height > 0);
+}
+
+function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analysisContext = null, deskewTransform = null) {
   const scaleX = viewport.width / Math.max(1, ocrViewport.width);
   const scaleY = viewport.height / Math.max(1, ocrViewport.height);
+  const normalizedWords = mapOcrWordsToOriginalCanvas(words, deskewTransform);
 
-  const spans = words
+  const spans = normalizedWords
     .filter((word) => !Number.isFinite(word.confidence) || word.confidence >= 25)
     .map((word, index) => {
       const x = word.box.left * scaleX;
@@ -1240,6 +1473,7 @@ function buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analys
         fontName: "OCR",
         fontStyle: "normal",
         fontWeight: 400,
+        fromOcr: true,
         backgroundColor: visualStyle.backgroundColor,
         textColor: visualStyle.textColor,
         sampleBox: visualStyle.sampleBox,
@@ -1345,6 +1579,7 @@ function makeBlockFromLines(lines, id, pageNumber, viewport, medianFont, pageVis
       fontFamily: line.fontFamily,
       fontName: line.fontName,
       fontStyle: line.fontStyle,
+      fromOcr: true,
       backgroundColor: line.backgroundColor,
       textColor: line.textColor,
       sampleBox: line.sampleBox,
@@ -1456,9 +1691,16 @@ function buildBlocksFromOcrLines(rawLines, viewport, pageNumber, medianFont) {
   };
 }
 
-function extractBlocksFromOcrData(data, viewport, ocrViewport, pageNumber, analysisContext = null) {
+function extractBlocksFromOcrData(data, viewport, ocrViewport, pageNumber, analysisContext = null, deskewTransform = null) {
   const words = collectOcrWords(data);
-  const { spans, lines, medianFont } = buildOcrLinesFromWords(words, viewport, ocrViewport, pageNumber, analysisContext);
+  const { spans, lines, medianFont } = buildOcrLinesFromWords(
+    words,
+    viewport,
+    ocrViewport,
+    pageNumber,
+    analysisContext,
+    deskewTransform,
+  );
   const { items, debugLines } = buildBlocksFromOcrLines(lines, viewport, pageNumber, medianFont);
   return { items, textSpans: spans, debugLines };
 }
@@ -1493,8 +1735,18 @@ async function runOcrForPdf(pdf) {
       const analysisContext = await renderPageAnalysisContext(page, viewport);
       const ocrViewport = page.getViewport({ scale: OCR_RENDER_SCALE });
       const { canvas } = await renderPageToCanvas(page, ocrViewport);
-      const result = await worker.recognize(canvas);
-      const pageText = extractBlocksFromOcrData(result.data, viewport, ocrViewport, pageNumber, analysisContext);
+      const deskew = estimateDeskewByProjection(canvas);
+      const deskewed = deskew.applied ? deskewCanvasByAngle(canvas, deskew.angle) : null;
+      const ocrCanvas = deskewed?.canvas || canvas;
+      const result = await worker.recognize(ocrCanvas);
+      const pageText = extractBlocksFromOcrData(
+        result.data,
+        viewport,
+        ocrViewport,
+        pageNumber,
+        analysisContext,
+        deskewed,
+      );
       ocrPages.push({
         pageNumber,
         width: viewport.width,
@@ -1503,6 +1755,7 @@ async function runOcrForPdf(pdf) {
         textSpans: pageText.textSpans,
         debugLines: pageText.debugLines || [],
         extractionMode: "ocr",
+        deskew,
       });
     }
     state.pages = ocrPages;
