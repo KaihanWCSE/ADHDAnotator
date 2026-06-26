@@ -732,6 +732,12 @@ function getCurrentBlockText(current) {
   return normalizeText(current.lines.map((line) => line.text).join(" "));
 }
 
+function getLineGroupBounds(lines) {
+  const x = Math.min(...lines.map((line) => line.x));
+  const right = Math.max(...lines.map((line) => line.x + line.width));
+  return { x, width: right - x };
+}
+
 function classifyBlock(block, medianFont) {
   const text = block.text.trim();
   const fromOcr = isOcrDerivedText(block);
@@ -1604,7 +1610,10 @@ function shouldMergeOcrLineBreak(previousText, nextText) {
   const next = normalizeText(nextText);
   if (!previous || !next) return false;
   if (/^[a-z(]/.test(next)) return true;
-  return /\b(the|a|an|of|and|or|to|with|for|in|on|by|from|as|that|which|because|but|it)$/i.test(previous.replace(/[.!?]+$/, ""));
+  if (/^(?:O\s*\(|[0-9])/.test(next)) {
+    return /\b(the|a|an|of|and|or|to|with|for|in|on|by|from|as|that|which|because|but|it)$/i.test(previous.replace(/[.!?]+$/, ""));
+  }
+  return false;
 }
 
 function normalizeOcrBlockText(lines) {
@@ -1730,11 +1739,16 @@ function buildBlocksFromOcrLines(rawLines, viewport, pageNumber, medianFont) {
 
     const previous = current[current.length - 1];
     const gap = previous ? line.y - (previous.y + previous.height) : 999;
+    const currentBounds = current.length ? getLineGroupBounds(current) : null;
     const sameColumn = previous ? (
       Math.abs(line.x - previous.x) < medianFont * 5
       || textBlocksOverlap({ x: previous.x, width: previous.width }, { x: line.x, width: line.width }) > 0.28
+      || (currentBounds && Math.abs(line.x - currentBounds.x) < medianFont * 5)
     ) : false;
-    const paragraphFlow = previous && sameColumn && gap <= medianFont * 3.4;
+    const danglingContinuation = previous
+      && shouldMergeOcrLineBreak(getCurrentBlockText({ lines: current }), line.text)
+      && gap <= medianFont * 3.4;
+    const paragraphFlow = previous && (sameColumn || danglingContinuation) && gap <= medianFont * 3.4;
 
     if (!paragraphFlow) flush();
     addDebugLine(line, "kept");

@@ -173,7 +173,7 @@ test("valid sentence ranges rebuild exact source text", async () => {
   assert.equal(secondSection.blocks[1].sourceText, SENTENCES[4]);
 });
 
-test("bullet ranges crossing source blocks are split into separate source links", async () => {
+test("bullet ranges crossing source blocks keep one visible source link", async () => {
   const firstBlockSentences = [
     "First page paragraphs can continue a thought through several sentences while still belonging to the same explanation in the original document.",
     "The first source block still has enough sentence structure and enough words to pass the backend readability filter.",
@@ -233,14 +233,12 @@ test("bullet ranges crossing source blocks are split into separate source links"
   const body = await response.json();
 
   assert.equal(response.status, 200);
-  assert.equal(body.stats.blocks, 4);
+  assert.equal(body.stats.blocks, 3);
   const blocks = body.articles[0].sections[0].blocks;
-  assert.deepEqual(blocks[1].sourceBlockIds, ["block-1"]);
-  assert.deepEqual(blocks[1].sentenceRange, [3, 3]);
-  assert.equal(blocks[1].sourceText, firstBlockSentences[2]);
-  assert.deepEqual(blocks[2].sourceBlockIds, ["block-2"]);
-  assert.deepEqual(blocks[2].sentenceRange, [4, 4]);
-  assert.equal(blocks[2].sourceText, secondBlockSentences[0]);
+  assert.deepEqual(blocks[1].sourceBlockIds, ["block-1", "block-2"]);
+  assert.deepEqual(blocks[1].sentenceRange, [3, 4]);
+  assert.equal(blocks[1].sourceText, `${firstBlockSentences[2]} ${secondBlockSentences[0]}`);
+  assert.equal(blocks[1].bullet, "Boundary continuation");
 });
 
 test("overlapping bullet ranges are rejected", async () => {
