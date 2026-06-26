@@ -2590,6 +2590,7 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
   const replacements = getSourceReplacements(pageData, pageAnnotations);
   const positioned = [];
   const replacedAnnotations = new Set();
+  const sourceById = new Map(pageData.items.map((item) => [item.id, item]));
 
   replacements.forEach(({ source, annotations }) => {
     const lines = getSourceLines(source);
@@ -2681,6 +2682,39 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
     });
   });
 
+  const clearedRegionIds = new Set(positioned.map((annotation) => annotation.sourceRegion?.id).filter(Boolean));
+  pageAnnotations.forEach((annotation) => {
+    coerceIdList(annotation.sourceItemIds).forEach((sourceId) => {
+      if (clearedRegionIds.has(sourceId)) return;
+      const source = sourceById.get(sourceId);
+      if (!source) return;
+      const sourceRegion = ctx ? getSourceRegion(ctx, pageData, source) : {
+        id: source.id,
+        x: source.x,
+        y: source.y,
+        width: source.width,
+        height: source.height,
+        background: { red: 255, green: 255, blue: 255 },
+        colors: getReplacementColors({ red: 255, green: 255, blue: 255 }),
+      };
+      positioned.push({
+        pageNumber: source.pageNumber,
+        sourceItemIds: [source.id],
+        anchorItemId: source.id,
+        kind: "clear",
+        label: "",
+        originalText: "",
+        x: source.x,
+        y: source.y,
+        width: source.width,
+        height: source.height,
+        sourceRegion,
+        clearOnly: true,
+      });
+      clearedRegionIds.add(sourceId);
+    });
+  });
+
   pageAnnotations.forEach((annotation) => {
     if (!replacedAnnotations.has(annotation)) {
       positioned.push({
@@ -2695,6 +2729,7 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
 }
 
 function drawReplacementText(ctx, annotation) {
+  if (annotation.clearOnly) return;
   const label = (annotation.replacementText || getCanvasLabel(annotation)).trimEnd();
   let fontSize = annotation.fontSize || (annotation.kind === "header" ? 15 : 13);
   const weight = annotation.kind === "header" ? 800 : 650;
