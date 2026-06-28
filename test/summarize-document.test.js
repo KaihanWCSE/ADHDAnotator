@@ -241,6 +241,78 @@ test("bullet ranges crossing source blocks keep one visible source link", async 
   assert.equal(blocks[1].bullet, "Boundary continuation");
 });
 
+test("non-adjacent page source blocks are summarized as separate article runs", async () => {
+  const pageOneSentences = [
+    "The first page introduces a scaling question with enough context for readers to understand the setup before any examples appear.",
+    "It explains that input growth changes the amount of repeated work in a program and gives the paragraph enough detail to pass readability filtering.",
+    "The final sentence on this page asks what happens when the input doubles and closes the first visible paragraph group.",
+  ];
+  const pageThreeSentences = [
+    "The third page starts a separate control flow discussion after a missing page gap in the OCR extraction output.",
+    "It describes loops and branches as different structures to inspect carefully while giving enough words for the backend source filter.",
+    "The final sentence explains that nested work can multiply operation counts and should not attach itself to page one.",
+  ];
+  mockAiResult({
+    d: "Gap Test",
+    a: [
+      {
+        id: "pdf-article-1-part-1",
+        t: "Gap Test",
+        sec: [
+          {
+            t: "Scaling Setup",
+            r: [1, 3],
+            b: [{ l: "Input growth question", r: [1, 3] }],
+          },
+        ],
+      },
+      {
+        id: "pdf-article-1-part-2",
+        t: "Gap Test",
+        sec: [
+          {
+            t: "Control Flow",
+            r: [1, 3],
+            b: [{ l: "Loop structure discussion", r: [1, 3] }],
+          },
+        ],
+      },
+    ],
+  });
+
+  const response = await handler(requestWithJson(sourcePayload({
+    title: "Gap Test",
+    articles: [
+      {
+        articleId: "pdf-article-1",
+        title: "Gap Test",
+        sourceBlocks: [
+          {
+            id: "page-1-block",
+            order: 0,
+            pageNumber: 1,
+            kind: "paragraph",
+            text: pageOneSentences.join(" "),
+          },
+          {
+            id: "page-3-block",
+            order: 1,
+            pageNumber: 3,
+            kind: "paragraph",
+            text: pageThreeSentences.join(" "),
+          },
+        ],
+      },
+    ],
+  })), TEST_CONTEXT);
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.articles.length, 2);
+  assert.deepEqual(body.articles[0].sections[0].blocks[0].sourceBlockIds, ["page-1-block"]);
+  assert.deepEqual(body.articles[1].sections[0].blocks[0].sourceBlockIds, ["page-3-block"]);
+});
+
 test("overlapping bullet ranges are rejected", async () => {
   mockAiResult({
     d: "Contract Test",

@@ -138,6 +138,38 @@ function sourceBlockSentences(sourceBlocks) {
   return sentences;
 }
 
+function sourceBlocksCanContinue(previousBlock, nextBlock) {
+  const previousPage = previousBlock?.pageNumber;
+  const nextPage = nextBlock?.pageNumber;
+  if (!Number.isFinite(previousPage) || !Number.isFinite(nextPage)) return true;
+  if (nextPage < previousPage) return false;
+  return nextPage - previousPage <= 1;
+}
+
+function splitIntoContinuousArticles(article) {
+  const runs = [];
+  let currentRun = [];
+
+  article.sourceBlocks.forEach((block) => {
+    const previousBlock = currentRun[currentRun.length - 1];
+    if (previousBlock && !sourceBlocksCanContinue(previousBlock, block)) {
+      runs.push(currentRun);
+      currentRun = [];
+    }
+    currentRun.push(block);
+  });
+  if (currentRun.length) runs.push(currentRun);
+
+  if (runs.length <= 1) return [article];
+
+  return runs.map((sourceBlocks, index) => ({
+    ...article,
+    articleId: `${article.articleId}-part-${index + 1}`,
+    sourceBlocks,
+    sentences: sourceBlockSentences(sourceBlocks),
+  })).filter((splitArticle) => splitArticle.sentences.length);
+}
+
 function hasEnoughSourceSentences(block) {
   const sourceSentences = splitIntoSentences(block.text).filter((sentence) => !isLikelyHeaderBlock(sentence));
   if (block.fromOcr) {
@@ -147,7 +179,7 @@ function hasEnoughSourceSentences(block) {
 }
 
 function normalizeArticles(rawArticles) {
-  return asArray(rawArticles).map((article, articleIndex) => {
+  return asArray(rawArticles).flatMap((article, articleIndex) => {
     const sourceBlocks = asArray(article.sourceBlocks)
       .slice(0, MAX_SOURCE_BLOCKS)
       .map((block, blockIndex) => ({
@@ -163,13 +195,13 @@ function normalizeArticles(rawArticles) {
       .filter(hasEnoughSourceSentences)
       .filter((block) => countWords(block.text) >= MIN_SOURCE_WORDS);
 
-    const sentences = sourceBlockSentences(sourceBlocks);
-    return {
+    const normalizedArticle = {
       articleId: String(article.articleId || `article-${articleIndex + 1}`),
       title: normalizeText(article.title) || `Article ${articleIndex + 1}`,
       sourceBlocks,
-      sentences,
+      sentences: sourceBlockSentences(sourceBlocks),
     };
+    return splitIntoContinuousArticles(normalizedArticle);
   }).filter((article) => article.sentences.length);
 }
 
