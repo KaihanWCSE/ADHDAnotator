@@ -64,6 +64,9 @@ const els = {
   popoverTemplate: document.getElementById("popoverTemplate"),
   modelSelect: document.getElementById("modelSelect"),
   modelMeta: document.getElementById("modelMeta"),
+  scannedPdfModal: document.getElementById("scannedPdfModal"),
+  scannedPdfConfirm: document.getElementById("scannedPdfConfirm"),
+  scannedPdfCancel: document.getElementById("scannedPdfCancel"),
 };
 
 const sampleText = `The American Civil War was a conflict between the northern states, known as the Union, and the southern states, known as the Confederacy, which had seceded from the United States. The war began in 1861 after years of political, economic, and moral tensions surrounding slavery, states' rights, and the expansion of slavery into western territories. Southern states depended heavily on enslaved labor for their agricultural economy, especially cotton production, while many in the North opposed the spread of slavery. The election of Abraham Lincoln in 1860 intensified these tensions because southern leaders feared his administration would limit slavery. Major battles such as Gettysburg, Antietam, and Vicksburg caused enormous casualties and destruction. During the war, Lincoln issued the Emancipation Proclamation, which declared enslaved people in Confederate states to be free and shifted the war's purpose toward ending slavery. The Union eventually defeated the Confederacy in 1865 due to its stronger industry, transportation systems, and larger population. The Civil War resulted in the abolition of slavery through the Thirteenth Amendment and permanently strengthened the federal government's authority over the states.`;
@@ -112,6 +115,40 @@ function setStatus(text, progress) {
   if (typeof progress === "number") {
     els.progressBar.style.width = `${Math.max(0, Math.min(100, progress))}%`;
   }
+}
+
+function confirmScannedPdf() {
+  return new Promise((resolve) => {
+    const modal = els.scannedPdfModal;
+    const confirmButton = els.scannedPdfConfirm;
+    const cancelButton = els.scannedPdfCancel;
+    if (!modal || !confirmButton || !cancelButton) {
+      resolve(true);
+      return;
+    }
+
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      modal.hidden = true;
+      confirmButton.removeEventListener("click", onConfirm);
+      cancelButton.removeEventListener("click", onCancel);
+      document.removeEventListener("keydown", onKeyDown);
+      resolve(value);
+    };
+    const onConfirm = () => finish(true);
+    const onCancel = () => finish(false);
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") finish(false);
+    };
+
+    confirmButton.addEventListener("click", onConfirm);
+    cancelButton.addEventListener("click", onCancel);
+    document.addEventListener("keydown", onKeyDown);
+    modal.hidden = false;
+    confirmButton.focus();
+  });
 }
 
 function countSentences(text) {
@@ -1899,9 +1936,7 @@ async function parsePdf(file) {
     return { looksScanned: false, ocrApplied: false };
   }
 
-  const shouldRunOcr = window.confirm(
-    "This PDF looks scanned. Is this a scanned PDF?\n\nScanned PDFs take more browser resources and may take longer to read because the app needs to run OCR before transforming the text."
-  );
+  const shouldRunOcr = await confirmScannedPdf();
   if (!shouldRunOcr) {
     state.ocrSkippedByUser = true;
     return { looksScanned: true, ocrApplied: false, ocrSkippedByUser: true };
