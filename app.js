@@ -42,6 +42,7 @@ const state = {
   extractionMode: "text",
   ocrApplied: false,
   ocrUnavailableReason: "",
+  ocrSkippedByUser: false,
 };
 
 const els = {
@@ -1874,6 +1875,7 @@ async function parsePdf(file) {
   state.extractionMode = "text";
   state.ocrApplied = false;
   state.ocrUnavailableReason = "";
+  state.ocrSkippedByUser = false;
 
   for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
     setStatus(`Reading page ${pageNumber} of ${pdf.numPages}...`, 8 + (pageNumber / pdf.numPages) * 34);
@@ -1895,6 +1897,14 @@ async function parsePdf(file) {
   const looksScanned = shouldTryOcrForParsedPdf(state.pages, pdf.numPages);
   if (!looksScanned) {
     return { looksScanned: false, ocrApplied: false };
+  }
+
+  const shouldRunOcr = window.confirm(
+    "This PDF looks scanned. Is this a scanned PDF?\n\nScanned PDFs take more browser resources and may take longer to read because the app needs to run OCR before transforming the text."
+  );
+  if (!shouldRunOcr) {
+    state.ocrSkippedByUser = true;
+    return { looksScanned: true, ocrApplied: false, ocrSkippedByUser: true };
   }
 
   if (pdf.numPages > OCR_MAX_SCANNED_PAGES) {
@@ -2867,6 +2877,11 @@ async function handleFile(file) {
 
     if (parseResult.ocrUnavailableReason === "too-many-pages") {
       setStatus(`This looks like a scanned PDF. Browser OCR is available for scanned PDFs up to ${OCR_MAX_SCANNED_PAGES} pages right now.`, 0);
+      return;
+    }
+
+    if (parseResult.ocrSkippedByUser) {
+      setStatus("OCR skipped. This PDF does not have enough selectable paragraph text to transform without OCR.", 0);
       return;
     }
 
