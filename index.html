@@ -94,9 +94,9 @@
       <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="scannedPdfTitle" aria-describedby="scannedPdfDescription">
         <div class="modal-mark">OCR</div>
         <h3 id="scannedPdfTitle">Is this a scanned PDF?</h3>
-        <p id="scannedPdfDescription">This PDF looks like it may be scanned. Scanned PDFs take more browser resources and may take longer because the app needs to run OCR before transforming the text.</p>
+        <p id="scannedPdfDescription">This PDF does not have enough detected text to transform, which makes it look like a scanned PDF. Scanned PDFs take more browser resources and may take longer because the app needs to run OCR (image-to-text reading) before transforming the text.</p>
         <div class="modal-actions">
-          <button class="secondary-action modal-secondary" id="scannedPdfCancel" type="button">No, skip OCR</button>
+          <button class="secondary-action modal-secondary" id="scannedPdfCancel" type="button">Try another file</button>
           <button class="primary-action modal-primary" id="scannedPdfConfirm" type="button">Yes, run OCR</button>
         </div>
       </section>
