@@ -19,7 +19,7 @@ const SCANNED_SOURCE_BLOCK_LIMIT = 0;
 
 const FALLBACK_MODELS = [
   { id: "openai/gpt-4.1-mini", name: "Balanced - GPT-4.1 Mini", prompt_price_per_mtok: 0.48, completion_price_per_mtok: 1.92 },
-  { id: "google/gemini-3.1-flash-lite", name: "Long PDF - Gemini 3.1 Flash Lite", prompt_price_per_mtok: 0.3, completion_price_per_mtok: 1.8 },
+  { id: "google/gemini-3.1-flash-lite", name: "Long Document - Gemini 3.1 Flash Lite", prompt_price_per_mtok: 0.3, completion_price_per_mtok: 1.8 },
   { id: "anthropic/claude-sonnet-4.6", name: "High Quality - Claude Sonnet 4.6", prompt_price_per_mtok: 3.6, completion_price_per_mtok: 18 },
   { id: "anthropic/claude-opus-4.7", name: "Premium - Claude Opus 4.7", prompt_price_per_mtok: 6, completion_price_per_mtok: 30 },
 ];
@@ -118,7 +118,7 @@ async function loadTesseract() {
 async function loadMammoth() {
   if (!mammothLoadPromise) {
     mammothLoadPromise = loadExternalScript(MAMMOTH_SCRIPT_URL).then(() => {
-      if (!window.mammoth?.extractRawText) throw new Error("Word document reader did not initialize.");
+      if (!window.mammoth?.convertToHtml) throw new Error("Word document reader did not initialize.");
       return window.mammoth;
     });
   }
@@ -1981,42 +1981,6 @@ async function parsePdf(file) {
   return { looksScanned: true, ocrApplied: true };
 }
 
-function splitDocxParagraphs(rawText) {
-  return String(rawText || "")
-    .replace(/\r/g, "\n")
-    .split(/\n{2,}/)
-    .map(normalizeText)
-    .filter(Boolean)
-    .filter((paragraph) => !isLikelyHeaderBlock(paragraph));
-}
-
-function groupDocxParagraphs(paragraphs) {
-  const groups = [];
-  let current = [];
-  const flush = () => {
-    if (!current.length) return;
-    groups.push(current.join(" "));
-    current = [];
-  };
-
-  paragraphs.forEach((paragraph) => {
-    current.push(paragraph);
-    const text = current.join(" ");
-    if (countWords(text) >= 90 && countSentences(text) >= 3) flush();
-  });
-
-  if (current.length) {
-    const trailing = current.join(" ");
-    if (groups.length && (countWords(trailing) < 40 || countSentences(trailing) < 3)) {
-      groups[groups.length - 1] = `${groups[groups.length - 1]} ${trailing}`;
-    } else {
-      groups.push(trailing);
-    }
-  }
-
-  return groups;
-}
-
 function makeDocxLineBoxes(text, x, y, width, fontSize) {
   const words = normalizeText(text).split(/\s+/).filter(Boolean);
   const averageCharWidth = fontSize * 0.5;
@@ -2048,12 +2012,55 @@ function makeDocxLineBoxes(text, x, y, width, fontSize) {
   }));
 }
 
+function getDocxParagraphKind(element, text) {
+  const tagName = element.tagName.toLowerCase();
+  if (/^h[1-6]$/.test(tagName)) return "header";
+  if (tagName === "li" || hasLeadingListMarkerShape(text)) return "bullet";
+  if (isLikelyHeaderBlock(text)) return "header";
+  return "paragraph";
+}
+
+function parseDocxTable(element) {
+  return [...element.querySelectorAll("tr")].map((row) => (
+    [...row.querySelectorAll("th,td")].map((cell) => normalizeText(cell.textContent))
+  )).filter((row) => row.some(Boolean));
+}
+
+function extractDocxElementsFromHtml(html) {
+  const parser = new DOMParser();
+  const documentHtml = parser.parseFromString(html || "", "text/html");
+  const elements = [];
+
+  [...documentHtml.body.children].forEach((element) => {
+    const tagName = element.tagName.toLowerCase();
+    if (tagName === "table") {
+      const rows = parseDocxTable(element);
+      const text = rows.flat().join(" ");
+      if (normalizeText(text)) elements.push({ kind: "table", text, rows });
+      return;
+    }
+
+    if (tagName === "ul" || tagName === "ol") {
+      [...element.querySelectorAll("li")].forEach((item) => {
+        const text = normalizeText(item.textContent);
+        if (text) elements.push({ kind: "bullet", text });
+      });
+      return;
+    }
+
+    const text = normalizeText(element.textContent);
+    if (!text) return;
+    elements.push({ kind: getDocxParagraphKind(element, text), text });
+  });
+
+  return elements;
+}
+
 async function parseDocx(file) {
   const mammoth = await loadMammoth();
   const arrayBuffer = await file.arrayBuffer();
-  const result = await mammoth.extractRawText({ arrayBuffer });
-  const paragraphs = splitDocxParagraphs(result.value);
-  const groups = groupDocxParagraphs(paragraphs);
+  const result = await mammoth.convertToHtml({ arrayBuffer });
+  const docxElements = extractDocxElementsFromHtml(result.value);
   const width = 820;
   const marginX = 82;
   const fontSize = 15;
@@ -2075,14 +2082,14 @@ async function parseDocx(file) {
   state.ocrUnavailableReason = "";
   state.ocrSkippedByUser = false;
 
-  groups.forEach((text, index) => {
-    const lineBoxes = makeDocxLineBoxes(text, marginX, y, sourceWidth, fontSize);
+  docxElements.forEach((element, index) => {
+    const lineBoxes = makeDocxLineBoxes(element.text, marginX, y, sourceWidth, fontSize);
     const height = Math.max(28, lineBoxes.length * Math.max(22, fontSize * 1.45));
     state.pages[0].items.push({
       id: `docx-b${index}`,
       pageNumber: 1,
-      kind: "paragraph",
-      text,
+      kind: element.kind,
+      text: element.text,
       x: marginX,
       y,
       width: sourceWidth,
@@ -2090,8 +2097,10 @@ async function parseDocx(file) {
       fontSize,
       lineBoxes,
       sourceLines: lineBoxes.map((line) => line.text),
+      rows: element.rows || null,
+      fromDocx: true,
     });
-    y += height + 28;
+    y += height + (element.kind === "header" ? 14 : 28);
   });
 
   state.pages[0].height = Math.max(720, y + 80);
@@ -2992,48 +3001,87 @@ async function renderPdfPages() {
 }
 
 function renderDocumentView() {
-  const data = state.summaryData;
   els.pages.innerHTML = "";
 
   const documentEl = document.createElement("article");
   documentEl.className = "document-view";
   documentEl.style.transform = `scale(${state.scale})`;
 
-  (data?.articles || []).forEach((article) => {
-    (article.sections || []).forEach((section) => {
-      const sectionEl = document.createElement("section");
-      sectionEl.className = "doc-section";
+  const annotationsByAnchor = new Map();
+  const consumedSourceIds = new Set();
+  state.annotations.forEach((annotation) => {
+    if (!annotation.anchorItemId) return;
+    if (!annotationsByAnchor.has(annotation.anchorItemId)) annotationsByAnchor.set(annotation.anchorItemId, []);
+    annotationsByAnchor.get(annotation.anchorItemId).push(annotation);
+    coerceIdList(annotation.sourceItemIds).forEach((sourceId) => consumedSourceIds.add(sourceId));
+  });
 
-      const heading = document.createElement("h3");
-      heading.textContent = section.title || "Section";
-      sectionEl.appendChild(heading);
+  const renderReplacement = (annotations) => {
+    const replacement = document.createElement("section");
+    replacement.className = "doc-section doc-replacement";
+    annotations
+      .filter((annotation) => annotation.kind !== "clear")
+      .sort((a, b) => (a.kind === "header" ? -1 : 1) - (b.kind === "header" ? -1 : 1) || a.y - b.y)
+      .forEach((annotation) => {
+        if (annotation.kind === "header") {
+          const heading = document.createElement("h3");
+          heading.textContent = annotation.label || "Section";
+          replacement.appendChild(heading);
+          return;
+        }
 
-      const list = document.createElement("div");
-      list.className = "doc-note-list";
-      (section.blocks || []).forEach((block) => {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "doc-note";
-        button.setAttribute("aria-label", `Show original text for ${block.bullet}`);
+        button.setAttribute("aria-label", `Show original text for ${annotation.label}`);
 
         const bullet = document.createElement("span");
         bullet.className = "doc-note-marker";
         bullet.textContent = "\u2022";
 
         const label = document.createElement("span");
-        label.textContent = block.bullet || "Summary point";
+        label.textContent = annotation.label || "Summary point";
 
         button.append(bullet, label);
         button.addEventListener("click", (event) => {
           event.stopPropagation();
-          showPopover(button, block.sourceText || "");
+          showPopover(button, annotation.originalText || "");
         });
-        list.appendChild(button);
+        replacement.appendChild(button);
       });
+    return replacement;
+  };
 
-      sectionEl.appendChild(list);
-      documentEl.appendChild(sectionEl);
-    });
+  const renderOriginal = (item) => {
+    if (item.kind === "table" && item.rows?.length) {
+      const table = document.createElement("table");
+      table.className = "doc-original-table";
+      item.rows.forEach((row) => {
+        const rowEl = document.createElement("tr");
+        row.forEach((cell) => {
+          const cellEl = document.createElement("td");
+          cellEl.textContent = cell;
+          rowEl.appendChild(cellEl);
+        });
+        table.appendChild(rowEl);
+      });
+      return table;
+    }
+
+    const element = document.createElement(item.kind === "header" ? "h2" : "p");
+    element.className = `doc-original doc-original-${item.kind}`;
+    element.textContent = item.text;
+    return element;
+  };
+
+  state.pages.flatMap((page) => page.items).forEach((item) => {
+    const anchoredAnnotations = annotationsByAnchor.get(item.id) || [];
+    if (anchoredAnnotations.length) {
+      documentEl.appendChild(renderReplacement(anchoredAnnotations));
+      return;
+    }
+    if (consumedSourceIds.has(item.id) && isReadableSourceBlock(item)) return;
+    documentEl.appendChild(renderOriginal(item));
   });
 
   els.pages.appendChild(documentEl);
