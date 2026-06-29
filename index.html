@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PDF Annotator AI</title>
+    <title>Document Annotator AI</title>
     <link rel="stylesheet" href="./styles.css" />
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs" type="module"></script>
   </head>
@@ -13,18 +13,18 @@
         <div class="brand">
           <div class="mark">P</div>
           <div>
-            <h1>PDF Annotator</h1>
-            <p>Turn dense PDFs into clickable presentation pages.</p>
+            <h1>Document Annotator</h1>
+            <p>Turn dense PDFs and Word documents into clickable presentation pages.</p>
           </div>
         </div>
 
         <label class="drop-zone" for="pdfInput" id="dropZone">
-          <input id="pdfInput" type="file" accept="application/pdf" />
-          <span class="drop-title">Upload PDF</span>
-          <span class="drop-meta">10 MB max, processed page by page</span>
+          <input id="pdfInput" type="file" accept="application/pdf,.pdf,.docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
+          <span class="drop-title">Upload Document</span>
+          <span class="drop-meta">PDF or DOCX, 10 MB max</span>
         </label>
 
-        <button class="primary-action" id="processButton" disabled>Transform PDF</button>
+        <button class="primary-action" id="processButton" disabled>Transform Document</button>
         <button class="secondary-action" id="sampleButton">Try Sample Text</button>
 
         <label class="model-picker" for="modelSelect">
@@ -51,7 +51,7 @@
           <div class="progress">
             <div id="progressBar"></div>
           </div>
-          <p id="statusText">Choose a PDF to begin.</p>
+          <p id="statusText">Choose a document to begin.</p>
         </div>
 
         <div class="legend">
@@ -75,8 +75,8 @@
 
         <div class="pages" id="pages">
           <div class="empty-state">
-            <h3>No PDF loaded</h3>
-            <p>Upload a PDF, then transform it into an annotated presentation.</p>
+            <h3>No document loaded</h3>
+            <p>Upload a PDF or Word document, then transform it into an annotated presentation.</p>
           </div>
         </div>
       </section>

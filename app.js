@@ -2,7 +2,9 @@ const APP_ID = "app_jnnlkgx7ehdy";
 const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
 const TESSERACT_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+const MAMMOTH_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/mammoth@1.9.1/mammoth.browser.min.js";
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
+const MAX_DOCX_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL = "openai/gpt-4.1-mini";
 const OCR_MAX_SCANNED_PAGES = 5;
 const OCR_RENDER_SCALE = 2.4;
@@ -32,9 +34,11 @@ const DEBUG_VISUAL_SPAN_SAMPLE_BOXES = false;
 
 const state = {
   file: null,
+  fileKind: "",
   pdf: null,
   pages: [],
   annotations: [],
+  summaryData: null,
   scale: 1,
   objectId: null,
   models: [],
@@ -78,6 +82,7 @@ async function loadPdfJs() {
 }
 
 let tesseractLoadPromise = null;
+let mammothLoadPromise = null;
 
 function loadExternalScript(src) {
   return new Promise((resolve, reject) => {
@@ -108,6 +113,29 @@ async function loadTesseract() {
     });
   }
   return tesseractLoadPromise;
+}
+
+async function loadMammoth() {
+  if (!mammothLoadPromise) {
+    mammothLoadPromise = loadExternalScript(MAMMOTH_SCRIPT_URL).then(() => {
+      if (!window.mammoth?.extractRawText) throw new Error("Word document reader did not initialize.");
+      return window.mammoth;
+    });
+  }
+  return mammothLoadPromise;
+}
+
+function isPdfFile(file) {
+  return file?.type === "application/pdf" || /\.pdf$/i.test(file?.name || "");
+}
+
+function isDocxFile(file) {
+  return file?.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    || /\.docx$/i.test(file?.name || "");
+}
+
+function getDocumentTitle(file = state.file) {
+  return file?.name?.replace(/\.(pdf|docx)$/i, "") || "Uploaded document";
 }
 
 function setStatus(text, progress) {
@@ -1953,6 +1981,123 @@ async function parsePdf(file) {
   return { looksScanned: true, ocrApplied: true };
 }
 
+function splitDocxParagraphs(rawText) {
+  return String(rawText || "")
+    .replace(/\r/g, "\n")
+    .split(/\n{2,}/)
+    .map(normalizeText)
+    .filter(Boolean)
+    .filter((paragraph) => !isLikelyHeaderBlock(paragraph));
+}
+
+function groupDocxParagraphs(paragraphs) {
+  const groups = [];
+  let current = [];
+  const flush = () => {
+    if (!current.length) return;
+    groups.push(current.join(" "));
+    current = [];
+  };
+
+  paragraphs.forEach((paragraph) => {
+    current.push(paragraph);
+    const text = current.join(" ");
+    if (countWords(text) >= 90 && countSentences(text) >= 3) flush();
+  });
+
+  if (current.length) {
+    const trailing = current.join(" ");
+    if (groups.length && (countWords(trailing) < 40 || countSentences(trailing) < 3)) {
+      groups[groups.length - 1] = `${groups[groups.length - 1]} ${trailing}`;
+    } else {
+      groups.push(trailing);
+    }
+  }
+
+  return groups;
+}
+
+function makeDocxLineBoxes(text, x, y, width, fontSize) {
+  const words = normalizeText(text).split(/\s+/).filter(Boolean);
+  const averageCharWidth = fontSize * 0.5;
+  const maxChars = Math.max(42, Math.floor(width / averageCharWidth));
+  const lineHeight = Math.max(22, fontSize * 1.45);
+  const lines = [];
+  let line = "";
+
+  words.forEach((word) => {
+    const candidate = line ? `${line} ${word}` : word;
+    if (candidate.length > maxChars && line) {
+      lines.push(line);
+      line = word;
+    } else {
+      line = candidate;
+    }
+  });
+  if (line) lines.push(line);
+
+  return lines.map((lineText, index) => ({
+    x,
+    y: y + index * lineHeight,
+    baselineY: y + index * lineHeight + fontSize,
+    width,
+    height: lineHeight,
+    fontSize,
+    text: lineText,
+    textLength: lineText.length,
+  }));
+}
+
+async function parseDocx(file) {
+  const mammoth = await loadMammoth();
+  const arrayBuffer = await file.arrayBuffer();
+  const result = await mammoth.extractRawText({ arrayBuffer });
+  const paragraphs = splitDocxParagraphs(result.value);
+  const groups = groupDocxParagraphs(paragraphs);
+  const width = 820;
+  const marginX = 82;
+  const fontSize = 15;
+  const sourceWidth = width - marginX * 2;
+  let y = 92;
+
+  state.pdf = null;
+  state.pages = [{
+    pageNumber: 1,
+    width,
+    height: 1000,
+    items: [],
+    textSpans: [],
+    debugLines: [],
+    extractionMode: "docx",
+  }];
+  state.extractionMode = "docx";
+  state.ocrApplied = false;
+  state.ocrUnavailableReason = "";
+  state.ocrSkippedByUser = false;
+
+  groups.forEach((text, index) => {
+    const lineBoxes = makeDocxLineBoxes(text, marginX, y, sourceWidth, fontSize);
+    const height = Math.max(28, lineBoxes.length * Math.max(22, fontSize * 1.45));
+    state.pages[0].items.push({
+      id: `docx-b${index}`,
+      pageNumber: 1,
+      kind: "paragraph",
+      text,
+      x: marginX,
+      y,
+      width: sourceWidth,
+      height,
+      fontSize,
+      lineBoxes,
+      sourceLines: lineBoxes.map((line) => line.text),
+    });
+    y += height + 28;
+  });
+
+  state.pages[0].height = Math.max(720, y + 80);
+  return { looksScanned: false, ocrApplied: false, documentMode: "docx" };
+}
+
 async function uploadPdf(file) {
   if (file.size < 1 || file.size > MAX_PDF_BYTES) {
     throw new Error("PDF must be between 1 byte and 10 MB.");
@@ -2031,10 +2176,10 @@ function buildArticlePayload() {
   }));
 
   return {
-    title: state.file?.name?.replace(/\.pdf$/i, "") || "Uploaded PDF",
+    title: getDocumentTitle(),
     articles: [{
-      articleId: "pdf-article-1",
-      title: state.file?.name?.replace(/\.pdf$/i, "") || "Uploaded PDF",
+      articleId: `${state.fileKind || "document"}-article-1`,
+      title: getDocumentTitle(),
       sourceBlocks,
     }],
   };
@@ -2131,16 +2276,16 @@ function annotationsFromStructuredSummary(data) {
 async function summarizeDocument() {
   const articlePayload = buildArticlePayload();
   if (!articlePayload.articles[0].sourceBlocks.length) {
-    throw new Error("This PDF does not contain enough long-form selectable text to summarize.");
+    throw new Error("This document does not contain enough long-form text to summarize.");
   }
 
-  setStatus(`Asking ${state.selectedModel} to structure the article...`, 62);
+  setStatus(`Asking ${state.selectedModel} to structure the document...`, 62);
   const response = await fetch(`${API_BASE}/fn/summarize-document`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       filename: state.file.name,
-      title: state.file.name.replace(/\.pdf$/i, ""),
+      title: getDocumentTitle(),
       fileObjectId: state.objectId,
       model: state.selectedModel,
       articles: articlePayload.articles,
@@ -2149,6 +2294,7 @@ async function summarizeDocument() {
   const data = await response.json();
   if (data.error) throw new Error(data.error);
   if (!response.ok) throw new Error("Summarization failed");
+  state.summaryData = data;
   state.annotations = annotationsFromStructuredSummary(data);
   if (!state.annotations.length) {
     throw new Error("The model returned no usable source-linked annotations.");
@@ -2845,6 +2991,55 @@ async function renderPdfPages() {
   setStatus("Presentation ready.", 100);
 }
 
+function renderDocumentView() {
+  const data = state.summaryData;
+  els.pages.innerHTML = "";
+
+  const documentEl = document.createElement("article");
+  documentEl.className = "document-view";
+  documentEl.style.transform = `scale(${state.scale})`;
+
+  (data?.articles || []).forEach((article) => {
+    (article.sections || []).forEach((section) => {
+      const sectionEl = document.createElement("section");
+      sectionEl.className = "doc-section";
+
+      const heading = document.createElement("h3");
+      heading.textContent = section.title || "Section";
+      sectionEl.appendChild(heading);
+
+      const list = document.createElement("div");
+      list.className = "doc-note-list";
+      (section.blocks || []).forEach((block) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "doc-note";
+        button.setAttribute("aria-label", `Show original text for ${block.bullet}`);
+
+        const bullet = document.createElement("span");
+        bullet.className = "doc-note-marker";
+        bullet.textContent = "\u2022";
+
+        const label = document.createElement("span");
+        label.textContent = block.bullet || "Summary point";
+
+        button.append(bullet, label);
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          showPopover(button, block.sourceText || "");
+        });
+        list.appendChild(button);
+      });
+
+      sectionEl.appendChild(list);
+      documentEl.appendChild(sectionEl);
+    });
+  });
+
+  els.pages.appendChild(documentEl);
+  setStatus("Document ready.", 100);
+}
+
 function createAnnotation(annotation) {
   if (!annotation.originalText) return null;
 
@@ -2882,30 +3077,38 @@ function refreshCounters() {
 }
 
 async function handleFile(file) {
-  if (!file || file.type !== "application/pdf") {
-    setStatus("Choose a valid PDF file.", 0);
+  if (!file || (!isPdfFile(file) && !isDocxFile(file))) {
+    setStatus("Choose a valid PDF or Word document.", 0);
     return;
   }
-  if (file.size < 1 || file.size > MAX_PDF_BYTES) {
+  const fileKind = isPdfFile(file) ? "pdf" : "docx";
+  const maxBytes = fileKind === "pdf" ? MAX_PDF_BYTES : MAX_DOCX_BYTES;
+  if (file.size < 1 || file.size > maxBytes) {
     state.file = null;
+    state.fileKind = "";
+    state.pdf = null;
+    state.pages = [];
     state.objectId = null;
     state.annotations = [];
+    state.summaryData = null;
     els.processButton.disabled = true;
     els.pages.innerHTML = "";
     els.fileName.textContent = file.name || "None";
     els.pageCount.textContent = "0";
     els.paragraphCount.textContent = "0";
-    setStatus("PDF must be between 1 byte and 10 MB.", 0);
+    setStatus("Document must be between 1 byte and 10 MB.", 0);
     return;
   }
   state.file = file;
+  state.fileKind = fileKind;
   state.objectId = null;
   state.annotations = [];
+  state.summaryData = null;
   els.processButton.disabled = true;
   els.pages.innerHTML = "";
-  setStatus("Loading PDF...", 5);
+  setStatus(fileKind === "pdf" ? "Loading PDF..." : "Loading Word document...", 5);
   try {
-    const parseResult = await parsePdf(file);
+    const parseResult = fileKind === "pdf" ? await parsePdf(file) : await parseDocx(file);
     refreshCounters();
     const sourceCount = getSourceItems().length;
     els.processButton.disabled = sourceCount < 1;
@@ -2926,29 +3129,35 @@ async function handleFile(file) {
     }
 
     if (sourceCount < 1) {
-      setStatus("I could not find enough large paragraph text to transform in this PDF.", 0);
+      setStatus("I could not find enough large paragraph text to transform in this document.", 0);
       return;
     }
 
-    setStatus(parseResult.ocrApplied
+    setStatus(fileKind === "docx"
+      ? "Word document ready. Transform it when you are ready."
+      : parseResult.ocrApplied
       ? "OCR complete. PDF ready. Transform it when you are ready."
       : "PDF ready. Transform it when you are ready.", 45);
   } catch (error) {
     console.error(error);
-    setStatus(error.message || "Could not read PDF.", 0);
+    setStatus(error.message || "Could not read document.", 0);
   }
 }
 
-async function processCurrentPdf() {
+async function processCurrentDocument() {
   if (!state.file || !state.pages.length) return;
   els.processButton.disabled = true;
   try {
     state.objectId = null;
     await summarizeDocument();
-    await renderPdfPages();
+    if (state.fileKind === "docx") {
+      renderDocumentView();
+    } else {
+      await renderPdfPages();
+    }
   } catch (error) {
     console.error(error);
-    setStatus(error.message || "Transform failed.", 0);
+  setStatus(error.message || "Transform failed.", 0);
   } finally {
     els.processButton.disabled = false;
   }
@@ -3034,7 +3243,7 @@ function wrapCanvasText(ctx, text, x, y, maxWidth, lineHeight) {
 function setZoom(nextScale) {
   state.scale = Math.max(0.55, Math.min(1.45, nextScale));
   els.zoomLabel.textContent = `${Math.round(state.scale * 100)}%`;
-  document.querySelectorAll(".page").forEach((page) => {
+  document.querySelectorAll(".page, .document-view").forEach((page) => {
     page.style.transform = `scale(${state.scale})`;
   });
 }
@@ -3108,7 +3317,7 @@ function enableExtractionDebugApi() {
 enableExtractionDebugApi();
 
 els.input.addEventListener("change", (event) => handleFile(event.target.files[0]));
-els.processButton.addEventListener("click", processCurrentPdf);
+els.processButton.addEventListener("click", processCurrentDocument);
 els.sampleButton.addEventListener("click", renderSample);
 els.zoomIn.addEventListener("click", () => setZoom(state.scale + 0.1));
 els.zoomOut.addEventListener("click", () => setZoom(state.scale - 0.1));

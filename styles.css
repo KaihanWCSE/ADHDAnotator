@@ -309,6 +309,58 @@ p {
   height: 100%;
 }
 
+.document-view {
+  position: relative;
+  width: min(860px, 100%);
+  padding: 54px 64px;
+  background: white;
+  box-shadow: var(--shadow);
+  transform-origin: top center;
+}
+
+.doc-section + .doc-section {
+  margin-top: 28px;
+}
+
+.doc-section h3 {
+  margin-bottom: 10px;
+  color: var(--blue);
+  font-size: 22px;
+  line-height: 1.25;
+}
+
+.doc-note-list {
+  display: grid;
+  gap: 8px;
+}
+
+.doc-note {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--rose);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  font-weight: 750;
+  line-height: 1.45;
+}
+
+.doc-note:hover,
+.doc-note:focus-visible {
+  background: rgba(254, 226, 226, 0.58);
+  outline: 2px solid rgba(190, 18, 60, 0.22);
+}
+
+.doc-note-marker {
+  line-height: 1.45;
+}
+
 .annotation {
   position: absolute;
   z-index: 2;
@@ -441,6 +493,10 @@ p {
 
   .pages {
     padding: 16px;
+  }
+
+  .document-view {
+    padding: 32px 22px;
   }
 
   .modal-actions {
