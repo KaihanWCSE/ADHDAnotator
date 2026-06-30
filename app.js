@@ -2163,14 +2163,88 @@ function isReadableSourceBlock(item) {
   return !getSourceBlockRejectReason(item);
 }
 
+function isDocxSourceCandidate(item) {
+  return Boolean(item?.fromDocx)
+    && item.kind === "paragraph"
+    && countWords(item.text || "") >= 25
+    && countSentences(item.text || "") >= 1
+    && !isLikelyHeaderBlock(item);
+}
+
+function makeDocxSourceBlock(items, index) {
+  const text = items.map((item) => item.text).join(" ");
+  const lineBoxes = items.flatMap((item) => item.lineBoxes || []);
+  const first = items[0];
+  const bottom = Math.max(...items.map((item) => (item.y || 0) + (item.height || 0)));
+  const right = Math.max(...items.map((item) => (item.x || 0) + (item.width || 0)));
+  const left = Math.min(...items.map((item) => item.x || 0));
+  return {
+    id: `docx-src-${index}`,
+    pageNumber: first.pageNumber,
+    kind: "paragraph",
+    text,
+    x: left,
+    y: first.y || 0,
+    width: Math.max(24, right - left),
+    height: Math.max(24, bottom - (first.y || 0)),
+    fontSize: first.fontSize || 15,
+    lineBoxes,
+    sourceLines: lineBoxes.map((line) => line.text),
+    sourceElementIds: items.map((item) => item.id),
+    fromDocx: true,
+    fromDocxSource: true,
+  };
+}
+
+function getDocxSourceItems() {
+  const sourceBlocks = [];
+  let current = [];
+  const flush = () => {
+    if (!current.length) return;
+    const text = current.map((item) => item.text).join(" ");
+    if (countWords(text) >= 40 && countSentences(text) >= 3) {
+      sourceBlocks.push(makeDocxSourceBlock(current, sourceBlocks.length));
+    }
+    current = [];
+  };
+
+  state.pages.flatMap((page) => page.items).forEach((item) => {
+    if (isDocxSourceCandidate(item)) {
+      current.push(item);
+      return;
+    }
+    flush();
+  });
+  flush();
+  return sourceBlocks;
+}
+
 function getSourceItems() {
+  if (state.fileKind === "docx") return getDocxSourceItems();
   return state.pages
     .flatMap((page) => page.items)
     .filter(isReadableSourceBlock);
 }
 
 function getSourceItemById() {
-  return new Map(state.pages.flatMap((page) => page.items).map((item) => [item.id, item]));
+  return new Map([
+    ...state.pages.flatMap((page) => page.items).map((item) => [item.id, item]),
+    ...getSourceItems().map((item) => [item.id, item]),
+  ]);
+}
+
+function getOriginalDocxElementIdsForAnnotation(annotation, sourceById) {
+  const ids = [annotation.anchorItemId, ...coerceIdList(annotation.sourceItemIds)].filter(Boolean);
+  const originalIds = [];
+  ids.forEach((id) => {
+    const item = sourceById.get(id);
+    if (Array.isArray(item?.sourceElementIds)) {
+      originalIds.push(...item.sourceElementIds);
+      return;
+    }
+    if (item?.fromDocx && !item.fromDocxSource) originalIds.push(item.id);
+  });
+  return [...new Set(originalIds)];
 }
 
 function buildArticlePayload() {
@@ -3007,13 +3081,16 @@ function renderDocumentView() {
   documentEl.className = "document-view";
   documentEl.style.transform = `scale(${state.scale})`;
 
-  const annotationsByAnchor = new Map();
-  const consumedSourceIds = new Set();
+  const sourceById = getSourceItemById();
+  const annotationsByElement = new Map();
+  const consumedElementIds = new Set();
   state.annotations.forEach((annotation) => {
-    if (!annotation.anchorItemId) return;
-    if (!annotationsByAnchor.has(annotation.anchorItemId)) annotationsByAnchor.set(annotation.anchorItemId, []);
-    annotationsByAnchor.get(annotation.anchorItemId).push(annotation);
-    coerceIdList(annotation.sourceItemIds).forEach((sourceId) => consumedSourceIds.add(sourceId));
+    const originalIds = getOriginalDocxElementIdsForAnnotation(annotation, sourceById);
+    const anchorId = originalIds[0] || annotation.anchorItemId;
+    if (!anchorId) return;
+    if (!annotationsByElement.has(anchorId)) annotationsByElement.set(anchorId, []);
+    annotationsByElement.get(anchorId).push(annotation);
+    originalIds.forEach((id) => consumedElementIds.add(id));
   });
 
   const renderReplacement = (annotations) => {
@@ -3075,12 +3152,12 @@ function renderDocumentView() {
   };
 
   state.pages.flatMap((page) => page.items).forEach((item) => {
-    const anchoredAnnotations = annotationsByAnchor.get(item.id) || [];
+    const anchoredAnnotations = annotationsByElement.get(item.id) || [];
     if (anchoredAnnotations.length) {
       documentEl.appendChild(renderReplacement(anchoredAnnotations));
       return;
     }
-    if (consumedSourceIds.has(item.id) && isReadableSourceBlock(item)) return;
+    if (consumedElementIds.has(item.id)) return;
     documentEl.appendChild(renderOriginal(item));
   });
 
