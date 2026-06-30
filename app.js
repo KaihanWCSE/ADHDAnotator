@@ -3098,7 +3098,7 @@ function renderDocumentView() {
     replacement.className = "doc-section doc-replacement";
     annotations
       .filter((annotation) => annotation.kind !== "clear")
-      .sort((a, b) => (a.kind === "header" ? -1 : 1) - (b.kind === "header" ? -1 : 1) || a.y - b.y)
+      .sort((a, b) => a.y - b.y || (a.kind === "header" ? -1 : 1) - (b.kind === "header" ? -1 : 1))
       .forEach((annotation) => {
         if (annotation.kind === "header") {
           const heading = document.createElement("h3");
