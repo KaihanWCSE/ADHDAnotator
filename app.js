@@ -170,17 +170,19 @@ async function importGoogleDocFromUrl(url) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url }),
   });
-  if (!response.ok) {
+  const contentType = response.headers.get("Content-Type") || "";
+  if (contentType.includes("application/json")) {
     const data = await response.json().catch(() => ({}));
     throw new Error(data.error || "Could not import Google Doc.");
   }
+  if (!response.ok) throw new Error("Could not import Google Doc.");
 
   const buffer = await response.arrayBuffer();
   if (!buffer.byteLength) throw new Error("Google Doc import returned no document data.");
   const encodedFilename = response.headers.get("X-Document-Filename") || "";
   const filename = encodedFilename ? decodeURIComponent(encodedFilename) : "google-doc.docx";
   return new File([buffer], normalizeDocxFilename(filename), {
-    type: response.headers.get("Content-Type") || DOCX_MIME,
+    type: contentType || DOCX_MIME,
   });
 }
 

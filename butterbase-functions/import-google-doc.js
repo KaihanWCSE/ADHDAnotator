@@ -18,6 +18,10 @@ function json(data, status = 200) {
   });
 }
 
+function validationError(error, code) {
+  return json({ error, code, skipped: true });
+}
+
 function normalizeText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
@@ -91,10 +95,10 @@ async function readRequestBody(request) {
 }
 
 function inaccessibleError() {
-  return json({
-    error: "Could not import this Google Doc. Make sure it is shared with anyone who has the link, or upload an exported DOCX file.",
-    code: "GOOGLE_DOC_NOT_ACCESSIBLE",
-  }, 400);
+  return validationError(
+    "Could not import this Google Doc. Make sure it is shared with anyone who has the link, or upload an exported DOCX file.",
+    "GOOGLE_DOC_NOT_ACCESSIBLE",
+  );
 }
 
 export async function handler(request) {
@@ -109,10 +113,7 @@ export async function handler(request) {
   const body = await readRequestBody(request);
   const documentId = extractGoogleDocId(body.url || body.documentId || body.id);
   if (!documentId) {
-    return json({
-      error: "Paste a valid Google Docs link.",
-      code: "INVALID_GOOGLE_DOC_URL",
-    }, 400);
+    return validationError("Paste a valid Google Docs link.", "INVALID_GOOGLE_DOC_URL");
   }
 
   const exportUrl = `https://docs.google.com/document/d/${documentId}/export?format=docx`;
@@ -130,10 +131,7 @@ export async function handler(request) {
 
   const buffer = await response.arrayBuffer();
   if (!buffer.byteLength || buffer.byteLength > MAX_DOCX_BYTES) {
-    return json({
-      error: "Google Doc export must be between 1 byte and 10 MB.",
-      code: "GOOGLE_DOC_SIZE_LIMIT",
-    }, 400);
+    return validationError("Google Doc export must be between 1 byte and 10 MB.", "GOOGLE_DOC_SIZE_LIMIT");
   }
 
   const filename = sanitizeFilename(filenameFromDisposition(response.headers.get("Content-Disposition"), documentId));
