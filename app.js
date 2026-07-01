@@ -72,6 +72,17 @@ const DEFAULT_READING_SETTINGS = {
   lineDistance: 145,
 };
 
+const COLOR_OPTIONS = {
+  blue: "#007aff",
+  teal: "#0f766e",
+  purple: "#7c3aed",
+  black: "#1d1d1f",
+  green: "#248a3d",
+  rose: "#ff375f",
+  red: "#ff3b30",
+  orange: "#ff9500",
+};
+
 function clampValue(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
@@ -99,8 +110,10 @@ const state = {
   ocrUnavailableReason: "",
   ocrSkippedByUser: false,
   selectedFont: localStorage.getItem("documentAnnotatorFont") || DEFAULT_READING_SETTINGS.font,
-  textSize: getStoredNumber("documentAnnotatorTextSize", DEFAULT_READING_SETTINGS.textSize, 90, 116),
-  lineDistance: getStoredNumber("documentAnnotatorLineDistance", DEFAULT_READING_SETTINGS.lineDistance, 120, 175),
+  textSize: getStoredNumber("documentAnnotatorTextSize", DEFAULT_READING_SETTINGS.textSize, 50, 200),
+  lineDistance: getStoredNumber("documentAnnotatorLineDistance", DEFAULT_READING_SETTINGS.lineDistance, 100, 300),
+  headerColor: localStorage.getItem("documentAnnotatorHeaderColor") || "blue",
+  bulletColor: localStorage.getItem("documentAnnotatorBulletColor") || "rose",
   popoverSettings: {},
   customizingPopoverKey: "",
   settingsRenderTimer: null,
@@ -128,6 +141,8 @@ const els = {
   popoverTemplate: document.getElementById("popoverTemplate"),
   modelSelect: document.getElementById("modelSelect"),
   modelMeta: document.getElementById("modelMeta"),
+  headerColorSelect: document.getElementById("headerColorSelect"),
+  bulletColorSelect: document.getElementById("bulletColorSelect"),
   readingSettingsPanel: document.getElementById("readingSettingsPanel"),
   settingsModeLabel: document.getElementById("settingsModeLabel"),
   fontSelect: document.getElementById("fontSelect"),
@@ -169,11 +184,15 @@ function getCanvasFont(weight, fontSize) {
 }
 
 function getReadingFontScale(settings = state) {
-  return clampValue(Number(settings.textSize) || DEFAULT_READING_SETTINGS.textSize, 90, 116) / 100;
+  return clampValue(Number(settings.textSize) || DEFAULT_READING_SETTINGS.textSize, 50, 200) / 100;
 }
 
 function getReadingLineHeight(settings = state) {
-  return clampValue(Number(settings.lineDistance) || DEFAULT_READING_SETTINGS.lineDistance, 120, 175) / 100;
+  return clampValue(Number(settings.lineDistance) || DEFAULT_READING_SETTINGS.lineDistance, 100, 300) / 100;
+}
+
+function getColorValue(colorKey, fallbackKey) {
+  return COLOR_OPTIONS[colorKey] || COLOR_OPTIONS[fallbackKey] || fallbackKey;
 }
 
 function getGlobalReadingSettings() {
@@ -219,6 +238,10 @@ function applyReadingSettings() {
   document.documentElement.style.setProperty("--app-font", option.css);
   document.documentElement.style.setProperty("--reading-font-scale", String(getReadingFontScale()));
   document.documentElement.style.setProperty("--reading-line-height", String(getReadingLineHeight()));
+  document.documentElement.style.setProperty("--header-color", getColorValue(state.headerColor, "blue"));
+  document.documentElement.style.setProperty("--bullet-color", getColorValue(state.bulletColor, "rose"));
+  if (els.headerColorSelect) els.headerColorSelect.value = COLOR_OPTIONS[state.headerColor] ? state.headerColor : "blue";
+  if (els.bulletColorSelect) els.bulletColorSelect.value = COLOR_OPTIONS[state.bulletColor] ? state.bulletColor : "rose";
   syncSettingsControls();
 }
 
@@ -255,11 +278,11 @@ async function updateGlobalReadingSettings(partial, rerenderImmediately = false)
     localStorage.setItem("documentAnnotatorFont", partial.font);
   }
   if (partial.textSize !== undefined) {
-    state.textSize = clampValue(Number(partial.textSize) || DEFAULT_READING_SETTINGS.textSize, 90, 116);
+    state.textSize = clampValue(Number(partial.textSize) || DEFAULT_READING_SETTINGS.textSize, 50, 200);
     localStorage.setItem("documentAnnotatorTextSize", String(state.textSize));
   }
   if (partial.lineDistance !== undefined) {
-    state.lineDistance = clampValue(Number(partial.lineDistance) || DEFAULT_READING_SETTINGS.lineDistance, 120, 175);
+    state.lineDistance = clampValue(Number(partial.lineDistance) || DEFAULT_READING_SETTINGS.lineDistance, 100, 300);
     localStorage.setItem("documentAnnotatorLineDistance", String(state.lineDistance));
   }
 
@@ -270,6 +293,19 @@ async function updateGlobalReadingSettings(partial, rerenderImmediately = false)
   } else {
     scheduleOutputRerender();
   }
+}
+
+async function updateAnnotationColors(partial) {
+  if (partial.headerColor && COLOR_OPTIONS[partial.headerColor]) {
+    state.headerColor = partial.headerColor;
+    localStorage.setItem("documentAnnotatorHeaderColor", state.headerColor);
+  }
+  if (partial.bulletColor && COLOR_OPTIONS[partial.bulletColor]) {
+    state.bulletColor = partial.bulletColor;
+    localStorage.setItem("documentAnnotatorBulletColor", state.bulletColor);
+  }
+  applyReadingSettings();
+  await rerenderCurrentOutput();
 }
 
 function loadExternalScript(src) {
@@ -3112,6 +3148,8 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
   const sourceById = new Map(pageData.items.map((item) => [item.id, item]));
   const readingFontScale = getReadingFontScale();
   const readingLineScale = getReadingLineHeight() / (DEFAULT_READING_SETTINGS.lineDistance / 100);
+  const headerTextColor = getColorValue(state.headerColor, "blue");
+  const bulletTextColor = getColorValue(state.bulletColor, "rose");
 
   replacements.forEach(({ source, annotations }) => {
     const lines = getSourceLines(source);
@@ -3197,7 +3235,7 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
           fontSize: fittedFontSize,
           replacementText: getFixedLengthReplacement(annotation, line.text || source.text),
           sourceRegion,
-          textColor: annotation.kind === "header" ? sourceRegion.colors.header : sourceRegion.colors.bullet,
+          textColor: annotation.kind === "header" ? headerTextColor : bulletTextColor,
         });
       });
     });
@@ -3254,7 +3292,7 @@ function drawReplacementText(ctx, annotation) {
   const label = (annotation.replacementText || getCanvasLabel(annotation)).trimEnd();
   let fontSize = annotation.fontSize || (annotation.kind === "header" ? 15 : 13);
   const weight = annotation.kind === "header" ? 800 : 650;
-  const color = annotation.textColor || (annotation.kind === "header" ? HEADER_COLOR_PALETTE[0] : BULLET_COLOR_PALETTE[0]);
+  const color = annotation.textColor || (annotation.kind === "header" ? getColorValue(state.headerColor, "blue") : getColorValue(state.bulletColor, "rose"));
 
   ctx.save();
   if (annotation.sourceRegion) {
@@ -3286,6 +3324,7 @@ function drawReplacementTexts(ctx, annotations) {
 async function renderPdfPages() {
   await loadSelectedFont();
   const pdf = state.pdf;
+  closeVisiblePopovers();
   if (state.customizingPopoverKey) exitPopoverCustomization();
   els.pages.innerHTML = "";
   for (let i = 1; i <= pdf.numPages; i += 1) {
@@ -3324,6 +3363,7 @@ async function renderPdfPages() {
 }
 
 function renderDocumentView() {
+  closeVisiblePopovers();
   if (state.customizingPopoverKey) exitPopoverCustomization();
   els.pages.innerHTML = "";
 
@@ -3467,25 +3507,24 @@ function getAnchorPopoverKey(anchor) {
 }
 
 function getPopoverContainer(anchor) {
-  return anchor.closest(".page, .document-view") || anchor.parentElement;
+  return document.body;
 }
 
-function getContainerScale(container) {
-  const width = container.offsetWidth || 1;
-  const rectWidth = container.getBoundingClientRect().width || width;
+function getAnchorScale(anchor) {
+  const width = anchor.offsetWidth || 1;
+  const rectWidth = anchor.getBoundingClientRect().width || width;
   return rectWidth / width || 1;
 }
 
-function getAnchorPoint(anchor, container) {
-  const scale = getContainerScale(container);
+function getAnchorPoint(anchor) {
+  const scale = getAnchorScale(anchor);
   const anchorRect = anchor.getBoundingClientRect();
-  const containerRect = container.getBoundingClientRect();
   const marker = anchor.querySelector?.(".doc-note-marker");
   if (marker) {
     const markerRect = marker.getBoundingClientRect();
     return {
-      x: (markerRect.left + markerRect.width / 2 - containerRect.left) / scale,
-      y: (markerRect.top + markerRect.height / 2 - containerRect.top) / scale,
+      x: markerRect.left + markerRect.width / 2,
+      y: markerRect.top + markerRect.height / 2,
       width: 0,
       height: 0,
     };
@@ -3494,32 +3533,32 @@ function getAnchorPoint(anchor, container) {
   const offsetY = Number(anchor.dataset.connectorOffsetY);
   if (Number.isFinite(offsetX) || Number.isFinite(offsetY)) {
     return {
-      x: (anchorRect.left - containerRect.left) / scale + (Number.isFinite(offsetX) ? offsetX : 0),
-      y: (anchorRect.top - containerRect.top) / scale + (Number.isFinite(offsetY) ? offsetY : anchorRect.height / scale / 2),
+      x: anchorRect.left + (Number.isFinite(offsetX) ? offsetX * scale : 0),
+      y: anchorRect.top + (Number.isFinite(offsetY) ? offsetY * scale : anchorRect.height / 2),
       width: 0,
       height: 0,
     };
   }
   return {
-    x: (anchorRect.left - containerRect.left) / scale,
-    y: (anchorRect.top - containerRect.top) / scale,
-    width: anchorRect.width / scale,
-    height: anchorRect.height / scale,
+    x: anchorRect.left,
+    y: anchorRect.top,
+    width: anchorRect.width,
+    height: anchorRect.height,
   };
 }
 
 function closePopover(popover) {
   const key = popover.dataset.popoverKey;
   if (state.customizingPopoverKey === key) exitPopoverCustomization();
+  popover.resizeObserver?.disconnect?.();
   if (key) {
-    popover.parentElement?.querySelector(`.popover-connector[data-popover-key="${CSS.escape(key)}"]`)?.remove();
+    document.querySelector(`.popover-connector[data-popover-key="${CSS.escape(key)}"]`)?.remove();
   }
   popover.remove();
 }
 
 function updatePopoverConnector(anchor, popover, connector) {
-  const container = getPopoverContainer(anchor);
-  const anchorPoint = getAnchorPoint(anchor, container);
+  const anchorPoint = getAnchorPoint(anchor);
   const startX = anchorPoint.x;
   const startY = anchorPoint.y + anchorPoint.height / 2;
   const popoverLeft = Number.parseFloat(popover.style.left) || 0;
@@ -3544,8 +3583,6 @@ function makePopoverDraggable(anchor, popover, connector) {
     if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
-    const container = getPopoverContainer(anchor);
-    const scale = getContainerScale(container);
     const startX = event.clientX;
     const startY = event.clientY;
     const startLeft = Number.parseFloat(popover.style.left) || 0;
@@ -3554,11 +3591,10 @@ function makePopoverDraggable(anchor, popover, connector) {
     handle.setPointerCapture(event.pointerId);
 
     const onMove = (moveEvent) => {
-      const nextLeft = startLeft + (moveEvent.clientX - startX) / scale;
-      const nextTop = startTop + (moveEvent.clientY - startY) / scale;
-      const minLeft = Math.min(8, -(popover.offsetWidth - 72));
-      popover.style.left = `${Math.max(minLeft, nextLeft)}px`;
-      popover.style.top = `${Math.max(8, nextTop)}px`;
+      const nextLeft = startLeft + (moveEvent.clientX - startX);
+      const nextTop = startTop + (moveEvent.clientY - startY);
+      popover.style.left = `${nextLeft}px`;
+      popover.style.top = `${nextTop}px`;
       updatePopoverConnector(anchor, popover, connector);
     };
 
@@ -3632,10 +3668,10 @@ function updateLocalPopoverSettings(partial) {
   const next = {
     font: partial.font && FONT_OPTIONS[partial.font] ? partial.font : current.font,
     textSize: partial.textSize !== undefined
-      ? clampValue(Number(partial.textSize) || current.textSize, 90, 116)
+      ? clampValue(Number(partial.textSize) || current.textSize, 50, 200)
       : current.textSize,
     lineDistance: partial.lineDistance !== undefined
-      ? clampValue(Number(partial.lineDistance) || current.lineDistance, 120, 175)
+      ? clampValue(Number(partial.lineDistance) || current.lineDistance, 100, 300)
       : current.lineDistance,
   };
   state.popoverSettings[key] = next;
@@ -3645,14 +3681,27 @@ function updateLocalPopoverSettings(partial) {
 }
 
 function resetPopoverState() {
+  closeVisiblePopovers();
   state.popoverSettings = {};
   if (state.customizingPopoverKey) exitPopoverCustomization();
 }
 
+function closeVisiblePopovers() {
+  document.querySelectorAll(".source-popover").forEach((popover) => closePopover(popover));
+}
+
+function refreshVisiblePopoverConnectors() {
+  document.querySelectorAll(".source-popover").forEach((popover) => {
+    const key = popover.dataset.popoverKey;
+    const anchor = popover.anchorRef;
+    const connector = key ? document.querySelector(`.popover-connector[data-popover-key="${CSS.escape(key)}"]`) : null;
+    if (anchor && connector) updatePopoverConnector(anchor, popover, connector);
+  });
+}
+
 function showPopover(anchor, text) {
-  const container = getPopoverContainer(anchor);
   const key = getAnchorPopoverKey(anchor);
-  const existing = container.querySelector(`.source-popover[data-popover-key="${CSS.escape(key)}"]`);
+  const existing = document.querySelector(`.source-popover[data-popover-key="${CSS.escape(key)}"]`);
   if (existing) {
     existing.focus();
     return;
@@ -3661,9 +3710,11 @@ function showPopover(anchor, text) {
   const connector = document.createElement("div");
   connector.className = "popover-connector";
   connector.dataset.popoverKey = key;
+  connector.anchorRef = anchor;
 
   const popover = els.popoverTemplate.content.firstElementChild.cloneNode(true);
   popover.dataset.popoverKey = key;
+  popover.anchorRef = anchor;
   popover.tabIndex = -1;
   popover.querySelector("p").textContent = text;
   const customizeButton = popover.querySelector(".customize-popover");
@@ -3682,25 +3733,30 @@ function showPopover(anchor, text) {
   popover.addEventListener("click", (event) => event.stopPropagation());
   popover.addEventListener("pointerdown", (event) => event.stopPropagation());
 
-  container.append(connector, popover);
+  document.body.append(connector, popover);
   applyPopoverReadingSettings(popover);
   updatePopoverCustomizeButtons();
 
-  const anchorPoint = getAnchorPoint(anchor, container);
-  const maxLeft = Math.max(8, container.offsetWidth - popover.offsetWidth - 8);
-  const left = Math.min(Math.max(8, anchorPoint.x), maxLeft);
+  const anchorPoint = getAnchorPoint(anchor);
+  const maxLeft = Math.max(12, window.innerWidth - popover.offsetWidth - 12);
+  const left = Math.min(Math.max(12, anchorPoint.x), maxLeft);
   const top = anchorPoint.y + anchorPoint.height + 8;
   popover.style.left = `${left}px`;
-  popover.style.top = `${Math.max(8, top)}px`;
+  popover.style.top = `${Math.max(12, top)}px`;
   updatePopoverConnector(anchor, popover, connector);
   makePopoverDraggable(anchor, popover, connector);
+  if (window.ResizeObserver) {
+    const observer = new ResizeObserver(() => updatePopoverConnector(anchor, popover, connector));
+    observer.observe(popover);
+    popover.resizeObserver = observer;
+  }
   popover.focus({ preventScroll: true });
 }
 
 function refreshCounters() {
   els.fileName.textContent = state.file?.name || "None";
   els.pageCount.textContent = String(state.pages.length);
-  els.paragraphCount.textContent = String(getSourceItems().length);
+  if (els.paragraphCount) els.paragraphCount.textContent = String(getSourceItems().length);
 }
 
 async function handleFile(file, options = {}) {
@@ -3724,7 +3780,7 @@ async function handleFile(file, options = {}) {
     els.pages.innerHTML = "";
     els.fileName.textContent = file.name || "None";
     els.pageCount.textContent = "0";
-    els.paragraphCount.textContent = "0";
+    if (els.paragraphCount) els.paragraphCount.textContent = "0";
     setStatus("Document must be between 1 byte and 10 MB.", 0);
     return;
   }
@@ -3920,8 +3976,7 @@ function populateModelSelect(models) {
   const defaultExists = state.models.some((model) => model.id === DEFAULT_MODEL);
   state.selectedModel = defaultExists ? DEFAULT_MODEL : state.models[0].id;
   els.modelSelect.value = state.selectedModel;
-  const selected = state.models.find((model) => model.id === state.selectedModel);
-  els.modelMeta.textContent = selected ? formatModelPrice(selected) : "Butterbase AI gateway";
+  if (els.modelMeta) els.modelMeta.textContent = "";
 }
 
 async function loadModelOptions() {
@@ -3933,7 +3988,7 @@ async function loadModelOptions() {
   } catch (error) {
     console.warn(error);
     populateModelSelect(FALLBACK_MODELS);
-    els.modelMeta.textContent = "Using fallback model list";
+    if (els.modelMeta) els.modelMeta.textContent = "";
   }
 }
 
@@ -4005,11 +4060,24 @@ els.lineDistanceRange.addEventListener("input", (event) => {
   });
 });
 els.settingsDoneButton.addEventListener("click", exitPopoverCustomization);
+els.headerColorSelect.addEventListener("change", (event) => {
+  updateAnnotationColors({ headerColor: event.target.value }).catch((error) => {
+    console.error(error);
+    setStatus("Header color changed, but the preview could not be redrawn.", 0);
+  });
+});
+els.bulletColorSelect.addEventListener("change", (event) => {
+  updateAnnotationColors({ bulletColor: event.target.value }).catch((error) => {
+    console.error(error);
+    setStatus("Bullet color changed, but the preview could not be redrawn.", 0);
+  });
+});
 els.modelSelect.addEventListener("change", () => {
   state.selectedModel = els.modelSelect.value || DEFAULT_MODEL;
-  const selected = state.models.find((model) => model.id === state.selectedModel);
-  els.modelMeta.textContent = selected ? formatModelPrice(selected) : "Butterbase AI gateway";
+  if (els.modelMeta) els.modelMeta.textContent = "";
 });
+window.addEventListener("scroll", refreshVisiblePopoverConnectors, true);
+window.addEventListener("resize", refreshVisiblePopoverConnectors);
 
 ["dragenter", "dragover"].forEach((eventName) => {
   els.dropZone.addEventListener(eventName, (event) => {
