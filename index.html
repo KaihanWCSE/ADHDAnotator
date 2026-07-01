@@ -43,17 +43,31 @@
           <small id="modelMeta">Butterbase AI gateway</small>
         </label>
 
-        <label class="font-picker" for="fontSelect">
-          <span>Reading font</span>
-          <select id="fontSelect">
-            <option value="lexend">Lexend</option>
-            <option value="verdana">Verdana</option>
-            <option value="comic-sans">Comic Sans</option>
-            <option value="calibri">Calibri</option>
-            <option value="arial">Arial</option>
-            <option value="opendyslexic">OpenDyslexic</option>
-          </select>
-        </label>
+        <section class="reading-settings" id="readingSettingsPanel">
+          <div class="settings-heading">
+            <span id="settingsModeLabel">Reading settings</span>
+          </div>
+          <label class="font-picker" for="fontSelect">
+            <span>Reading font</span>
+            <select id="fontSelect">
+              <option value="lexend">Lexend</option>
+              <option value="verdana">Verdana</option>
+              <option value="comic-sans">Comic Sans</option>
+              <option value="calibri">Calibri</option>
+              <option value="arial">Arial</option>
+              <option value="opendyslexic">OpenDyslexic</option>
+            </select>
+          </label>
+          <label class="range-setting" for="textSizeRange">
+            <span>Text size <strong id="textSizeValue">100%</strong></span>
+            <input id="textSizeRange" type="range" min="90" max="116" step="1" value="100" />
+          </label>
+          <label class="range-setting" for="lineDistanceRange">
+            <span>Line distance <strong id="lineDistanceValue">1.45</strong></span>
+            <input id="lineDistanceRange" type="range" min="120" max="175" step="5" value="145" />
+          </label>
+          <button class="secondary-action settings-done" id="settingsDoneButton" type="button" hidden>Done</button>
+        </section>
 
         <div class="status-card">
           <div class="status-row">
@@ -106,7 +120,10 @@
       <div class="source-popover">
         <div class="source-popover-header">
           <h4>Original Text</h4>
-          <button class="close-popover" aria-label="Close">x</button>
+          <div class="source-popover-actions">
+            <button class="customize-popover" type="button" aria-label="Customize text window">Aa</button>
+            <button class="close-popover" type="button" aria-label="Close">x</button>
+          </div>
         </div>
         <p></p>
       </div>

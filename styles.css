@@ -12,6 +12,8 @@
   --rose: #be123c;
   --shadow: 0 18px 48px rgba(31, 41, 51, 0.12);
   --app-font: Lexend, Verdana, Arial, sans-serif;
+  --reading-font-scale: 1;
+  --reading-line-height: 1.45;
 }
 
 @font-face {
@@ -199,22 +201,19 @@ p {
   border-color: var(--line);
 }
 
-.model-picker,
-.font-picker {
+.model-picker {
   display: grid;
   gap: 7px;
   margin-top: 16px;
 }
 
-.model-picker span,
-.font-picker span {
+.model-picker span {
   font-size: 13px;
   font-weight: 800;
   color: var(--ink);
 }
 
-.model-picker select,
-.font-picker select {
+.model-picker select {
   width: 100%;
   min-height: 42px;
   padding: 0 12px;
@@ -228,6 +227,73 @@ p {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.35;
+}
+
+.reading-settings {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.reading-settings.customizing {
+  border-color: rgba(37, 99, 235, 0.55);
+  background: #eff6ff;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+}
+
+.settings-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-heading span,
+.font-picker span,
+.range-setting span {
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.font-picker,
+.range-setting {
+  display: grid;
+  gap: 7px;
+}
+
+.font-picker select {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink);
+  background: white;
+}
+
+.range-setting span {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.range-setting strong {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.range-setting input {
+  width: 100%;
+  accent-color: var(--blue);
+}
+
+.settings-done {
+  margin-top: 0;
 }
 
 .status-card,
@@ -379,6 +445,8 @@ p {
   position: relative;
   width: min(860px, 100%);
   padding: 54px 64px;
+  font-size: calc(15px * var(--reading-font-scale));
+  line-height: var(--reading-line-height);
   background: white;
   box-shadow: var(--shadow);
   transform-origin: top center;
@@ -391,14 +459,14 @@ p {
 .doc-original {
   margin: 12px 0;
   color: var(--ink);
-  font-size: 15px;
-  line-height: 1.6;
+  font-size: 1em;
+  line-height: max(1.35, var(--reading-line-height));
 }
 
 .doc-original-header {
   margin: 26px 0 10px;
   color: var(--ink);
-  font-size: 20px;
+  font-size: 1.35em;
   line-height: 1.25;
 }
 
@@ -413,7 +481,7 @@ p {
   margin: 16px 0;
   border-collapse: collapse;
   color: var(--ink);
-  font-size: 14px;
+  font-size: 0.94em;
 }
 
 .doc-original-table td {
@@ -431,8 +499,8 @@ p {
 .doc-section h3 {
   margin-bottom: 10px;
   color: var(--blue);
-  font-size: 22px;
-  line-height: 1.25;
+  font-size: 1.48em;
+  line-height: max(1.2, calc(var(--reading-line-height) * 0.88));
 }
 
 .doc-note {
@@ -449,7 +517,8 @@ p {
   text-align: left;
   cursor: pointer;
   font-weight: 750;
-  line-height: 1.45;
+  font-size: 1em;
+  line-height: var(--reading-line-height);
 }
 
 .doc-note:hover,
@@ -459,7 +528,7 @@ p {
 }
 
 .doc-note-marker {
-  line-height: 1.45;
+  line-height: var(--reading-line-height);
 }
 
 .annotation {
@@ -482,8 +551,12 @@ p {
   position: absolute;
   z-index: 30;
   width: min(420px, 86vw);
-  max-height: 260px;
+  min-width: 240px;
+  min-height: 138px;
+  max-width: min(760px, 92vw);
+  max-height: min(560px, 82vh);
   overflow: auto;
+  resize: both;
   padding: 12px 16px 16px;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -503,23 +576,30 @@ p {
   touch-action: none;
 }
 
+.source-popover-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .source-popover-header:active {
   cursor: grabbing;
 }
 
 .source-popover h4 {
-  font-size: 13px;
+  font-size: calc(13px * var(--popover-font-scale, var(--reading-font-scale)));
   color: var(--muted);
   text-transform: uppercase;
 }
 
 .source-popover p {
-  font-size: 14px;
-  line-height: 1.5;
+  font-size: calc(14px * var(--popover-font-scale, var(--reading-font-scale)));
+  line-height: var(--popover-line-height, var(--reading-line-height));
   white-space: pre-wrap;
 }
 
-.close-popover {
+.close-popover,
+.customize-popover {
   flex: 0 0 auto;
   width: 24px;
   height: 24px;
@@ -527,6 +607,12 @@ p {
   border-radius: 6px;
   background: white;
   cursor: pointer;
+}
+
+.customize-popover.active {
+  color: white;
+  border-color: var(--blue);
+  background: var(--blue);
 }
 
 .popover-connector {

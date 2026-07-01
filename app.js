@@ -66,6 +66,22 @@ const FONT_OPTIONS = {
   },
 };
 
+const DEFAULT_READING_SETTINGS = {
+  font: "lexend",
+  textSize: 100,
+  lineDistance: 145,
+};
+
+function clampValue(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function getStoredNumber(key, fallback, min, max) {
+  const value = Number(localStorage.getItem(key));
+  if (!Number.isFinite(value)) return fallback;
+  return clampValue(value, min, max);
+}
+
 const state = {
   file: null,
   fileKind: "",
@@ -82,7 +98,12 @@ const state = {
   ocrApplied: false,
   ocrUnavailableReason: "",
   ocrSkippedByUser: false,
-  selectedFont: localStorage.getItem("documentAnnotatorFont") || "lexend",
+  selectedFont: localStorage.getItem("documentAnnotatorFont") || DEFAULT_READING_SETTINGS.font,
+  textSize: getStoredNumber("documentAnnotatorTextSize", DEFAULT_READING_SETTINGS.textSize, 90, 116),
+  lineDistance: getStoredNumber("documentAnnotatorLineDistance", DEFAULT_READING_SETTINGS.lineDistance, 120, 175),
+  popoverSettings: {},
+  customizingPopoverKey: "",
+  settingsRenderTimer: null,
 };
 
 const els = {
@@ -107,7 +128,14 @@ const els = {
   popoverTemplate: document.getElementById("popoverTemplate"),
   modelSelect: document.getElementById("modelSelect"),
   modelMeta: document.getElementById("modelMeta"),
+  readingSettingsPanel: document.getElementById("readingSettingsPanel"),
+  settingsModeLabel: document.getElementById("settingsModeLabel"),
   fontSelect: document.getElementById("fontSelect"),
+  textSizeRange: document.getElementById("textSizeRange"),
+  textSizeValue: document.getElementById("textSizeValue"),
+  lineDistanceRange: document.getElementById("lineDistanceRange"),
+  lineDistanceValue: document.getElementById("lineDistanceValue"),
+  settingsDoneButton: document.getElementById("settingsDoneButton"),
   scannedPdfModal: document.getElementById("scannedPdfModal"),
   scannedPdfConfirm: document.getElementById("scannedPdfConfirm"),
   scannedPdfCancel: document.getElementById("scannedPdfCancel"),
@@ -128,12 +156,43 @@ function getSelectedFontOption() {
   return FONT_OPTIONS[state.selectedFont] || FONT_OPTIONS.lexend;
 }
 
+function getFontOption(font = state.selectedFont) {
+  return FONT_OPTIONS[font] || FONT_OPTIONS.lexend;
+}
+
 function getCanvasFontFamily() {
   return getSelectedFontOption().canvas;
 }
 
 function getCanvasFont(weight, fontSize) {
   return `${weight} ${fontSize}px ${getCanvasFontFamily()}`;
+}
+
+function getReadingFontScale(settings = state) {
+  return clampValue(Number(settings.textSize) || DEFAULT_READING_SETTINGS.textSize, 90, 116) / 100;
+}
+
+function getReadingLineHeight(settings = state) {
+  return clampValue(Number(settings.lineDistance) || DEFAULT_READING_SETTINGS.lineDistance, 120, 175) / 100;
+}
+
+function getGlobalReadingSettings() {
+  return {
+    font: FONT_OPTIONS[state.selectedFont] ? state.selectedFont : DEFAULT_READING_SETTINGS.font,
+    textSize: state.textSize,
+    lineDistance: state.lineDistance,
+  };
+}
+
+function getPopoverSettings(key) {
+  return state.popoverSettings[key] || null;
+}
+
+function getActiveControlSettings() {
+  if (state.customizingPopoverKey) {
+    return getPopoverSettings(state.customizingPopoverKey) || getGlobalReadingSettings();
+  }
+  return getGlobalReadingSettings();
 }
 
 async function loadSelectedFont() {
@@ -146,10 +205,21 @@ async function loadSelectedFont() {
   ]);
 }
 
-function applySelectedFont() {
+function syncSettingsControls() {
+  const settings = getActiveControlSettings();
+  if (els.fontSelect) els.fontSelect.value = settings.font;
+  if (els.textSizeRange) els.textSizeRange.value = String(settings.textSize);
+  if (els.textSizeValue) els.textSizeValue.textContent = `${settings.textSize}%`;
+  if (els.lineDistanceRange) els.lineDistanceRange.value = String(settings.lineDistance);
+  if (els.lineDistanceValue) els.lineDistanceValue.textContent = (settings.lineDistance / 100).toFixed(2);
+}
+
+function applyReadingSettings() {
   const option = getSelectedFontOption();
   document.documentElement.style.setProperty("--app-font", option.css);
-  if (els.fontSelect) els.fontSelect.value = state.selectedFont;
+  document.documentElement.style.setProperty("--reading-font-scale", String(getReadingFontScale()));
+  document.documentElement.style.setProperty("--reading-line-height", String(getReadingLineHeight()));
+  syncSettingsControls();
 }
 
 async function rerenderCurrentOutput() {
@@ -168,12 +238,38 @@ async function rerenderCurrentOutput() {
   }
 }
 
-async function updateSelectedFont(nextFont) {
-  if (!FONT_OPTIONS[nextFont]) return;
-  state.selectedFont = nextFont;
-  localStorage.setItem("documentAnnotatorFont", nextFont);
-  applySelectedFont();
-  await rerenderCurrentOutput();
+function scheduleOutputRerender() {
+  if (state.settingsRenderTimer) window.clearTimeout(state.settingsRenderTimer);
+  state.settingsRenderTimer = window.setTimeout(() => {
+    state.settingsRenderTimer = null;
+    rerenderCurrentOutput().catch((error) => {
+      console.error(error);
+      setStatus("Settings changed, but the preview could not be redrawn.", 0);
+    });
+  }, 140);
+}
+
+async function updateGlobalReadingSettings(partial, rerenderImmediately = false) {
+  if (partial.font && FONT_OPTIONS[partial.font]) {
+    state.selectedFont = partial.font;
+    localStorage.setItem("documentAnnotatorFont", partial.font);
+  }
+  if (partial.textSize !== undefined) {
+    state.textSize = clampValue(Number(partial.textSize) || DEFAULT_READING_SETTINGS.textSize, 90, 116);
+    localStorage.setItem("documentAnnotatorTextSize", String(state.textSize));
+  }
+  if (partial.lineDistance !== undefined) {
+    state.lineDistance = clampValue(Number(partial.lineDistance) || DEFAULT_READING_SETTINGS.lineDistance, 120, 175);
+    localStorage.setItem("documentAnnotatorLineDistance", String(state.lineDistance));
+  }
+
+  applyReadingSettings();
+  await loadSelectedFont();
+  if (rerenderImmediately) {
+    await rerenderCurrentOutput();
+  } else {
+    scheduleOutputRerender();
+  }
 }
 
 function loadExternalScript(src) {
@@ -3014,6 +3110,8 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
   const positioned = [];
   const replacedAnnotations = new Set();
   const sourceById = new Map(pageData.items.map((item) => [item.id, item]));
+  const readingFontScale = getReadingFontScale();
+  const readingLineScale = getReadingLineHeight() / (DEFAULT_READING_SETTINGS.lineDistance / 100);
 
   replacements.forEach(({ source, annotations }) => {
     const lines = getSourceLines(source);
@@ -3034,9 +3132,9 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
     const regionRight = sourceRegion.x + sourceRegion.width - regionPadding;
     const regionTop = sourceRegion.y + regionPadding;
     const regionHeight = Math.max(12, sourceRegion.height - regionPadding * 2);
-    const baseAnnotationLineHeight = Math.max(22, lineHeight, fontSize * 1.65);
-    const baseBulletFontSize = Math.max(12, fontSize * 0.96);
-    const baseHeaderFontSize = Math.max(14, fontSize * 1.08);
+    const baseAnnotationLineHeight = Math.max(22, lineHeight, fontSize * 1.65 * readingLineScale);
+    const baseBulletFontSize = Math.max(12, fontSize * 0.96 * readingFontScale);
+    const baseHeaderFontSize = Math.max(14, fontSize * 1.08 * readingFontScale);
     const replacementRows = [];
 
     for (let index = 0; index < orderedAnnotations.length; index += 1) {
@@ -3142,7 +3240,7 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
     if (!replacedAnnotations.has(annotation)) {
       positioned.push({
         ...annotation,
-        fontSize: annotation.kind === "header" ? 15 : 13,
+        fontSize: (annotation.kind === "header" ? 15 : 13) * readingFontScale,
         replacementText: getFixedLengthReplacement(annotation, annotation.originalText || ""),
       });
     }
@@ -3188,6 +3286,7 @@ function drawReplacementTexts(ctx, annotations) {
 async function renderPdfPages() {
   await loadSelectedFont();
   const pdf = state.pdf;
+  if (state.customizingPopoverKey) exitPopoverCustomization();
   els.pages.innerHTML = "";
   for (let i = 1; i <= pdf.numPages; i += 1) {
     setStatus(`Rendering presentation page ${i} of ${pdf.numPages}...`, 82 + (i / pdf.numPages) * 14);
@@ -3225,6 +3324,7 @@ async function renderPdfPages() {
 }
 
 function renderDocumentView() {
+  if (state.customizingPopoverKey) exitPopoverCustomization();
   els.pages.innerHTML = "";
 
   const documentEl = document.createElement("article");
@@ -3260,6 +3360,7 @@ function renderDocumentView() {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "doc-note";
+        button.dataset.popoverKey = getAnnotationPopoverKey(annotation);
         button.setAttribute("aria-label", `Show original text for ${annotation.label}`);
 
         const bullet = document.createElement("span");
@@ -3321,17 +3422,41 @@ function createAnnotation(annotation) {
   const button = document.createElement("button");
   button.className = `annotation ${annotation.kind}`;
   button.type = "button";
+  button.dataset.popoverKey = getAnnotationPopoverKey(annotation);
   button.setAttribute("aria-label", `Show original text for ${annotation.label}`);
   button.title = annotation.label;
   button.style.left = `${annotation.x}px`;
   button.style.top = `${annotation.y}px`;
   button.style.width = `${annotation.width}px`;
   button.style.height = `${Math.max(20, annotation.height)}px`;
+  if (annotation.kind === "bullet") {
+    const fontSize = annotation.fontSize || 13;
+    const ctx = getLayoutMeasureContext();
+    if (ctx) {
+      ctx.font = getCanvasFont(650, fontSize);
+      button.dataset.connectorOffsetX = String(Math.max(2, ctx.measureText("\u2022").width / 2));
+    }
+    button.dataset.connectorOffsetY = String(Math.max(10, Math.max(20, annotation.height) / 2));
+  }
   button.addEventListener("click", (event) => {
     event.stopPropagation();
     showPopover(button, annotation.originalText);
   });
   return button;
+}
+
+function hashString(value) {
+  let hash = 0;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash = ((hash << 5) - hash + text.charCodeAt(index)) | 0;
+  }
+  return Math.abs(hash).toString(36);
+}
+
+function getAnnotationPopoverKey(annotation) {
+  const sourceIds = coerceIdList(annotation.sourceItemIds).join("|");
+  return `source-${hashString(`${annotation.kind}|${sourceIds}|${annotation.label}|${annotation.originalText}`)}`;
 }
 
 function getAnchorPopoverKey(anchor) {
@@ -3355,6 +3480,26 @@ function getAnchorPoint(anchor, container) {
   const scale = getContainerScale(container);
   const anchorRect = anchor.getBoundingClientRect();
   const containerRect = container.getBoundingClientRect();
+  const marker = anchor.querySelector?.(".doc-note-marker");
+  if (marker) {
+    const markerRect = marker.getBoundingClientRect();
+    return {
+      x: (markerRect.left + markerRect.width / 2 - containerRect.left) / scale,
+      y: (markerRect.top + markerRect.height / 2 - containerRect.top) / scale,
+      width: 0,
+      height: 0,
+    };
+  }
+  const offsetX = Number(anchor.dataset.connectorOffsetX);
+  const offsetY = Number(anchor.dataset.connectorOffsetY);
+  if (Number.isFinite(offsetX) || Number.isFinite(offsetY)) {
+    return {
+      x: (anchorRect.left - containerRect.left) / scale + (Number.isFinite(offsetX) ? offsetX : 0),
+      y: (anchorRect.top - containerRect.top) / scale + (Number.isFinite(offsetY) ? offsetY : anchorRect.height / scale / 2),
+      width: 0,
+      height: 0,
+    };
+  }
   return {
     x: (anchorRect.left - containerRect.left) / scale,
     y: (anchorRect.top - containerRect.top) / scale,
@@ -3365,6 +3510,7 @@ function getAnchorPoint(anchor, container) {
 
 function closePopover(popover) {
   const key = popover.dataset.popoverKey;
+  if (state.customizingPopoverKey === key) exitPopoverCustomization();
   if (key) {
     popover.parentElement?.querySelector(`.popover-connector[data-popover-key="${CSS.escape(key)}"]`)?.remove();
   }
@@ -3394,7 +3540,7 @@ function makePopoverDraggable(anchor, popover, connector) {
   if (!handle) return;
 
   handle.addEventListener("pointerdown", (event) => {
-    if (event.target.closest(".close-popover")) return;
+    if (event.target.closest(".close-popover, .customize-popover")) return;
     if (event.button !== 0) return;
     event.preventDefault();
     event.stopPropagation();
@@ -3410,7 +3556,8 @@ function makePopoverDraggable(anchor, popover, connector) {
     const onMove = (moveEvent) => {
       const nextLeft = startLeft + (moveEvent.clientX - startX) / scale;
       const nextTop = startTop + (moveEvent.clientY - startY) / scale;
-      popover.style.left = `${Math.max(8, nextLeft)}px`;
+      const minLeft = Math.min(8, -(popover.offsetWidth - 72));
+      popover.style.left = `${Math.max(minLeft, nextLeft)}px`;
       popover.style.top = `${Math.max(8, nextTop)}px`;
       updatePopoverConnector(anchor, popover, connector);
     };
@@ -3425,6 +3572,81 @@ function makePopoverDraggable(anchor, popover, connector) {
     handle.addEventListener("pointerup", onEnd);
     handle.addEventListener("pointercancel", onEnd);
   });
+}
+
+function applyPopoverReadingSettings(popover) {
+  const key = popover.dataset.popoverKey;
+  const settings = key ? getPopoverSettings(key) : null;
+  if (!settings) {
+    popover.style.fontFamily = "";
+    popover.style.removeProperty("--popover-font-scale");
+    popover.style.removeProperty("--popover-line-height");
+    return;
+  }
+
+  const option = getFontOption(settings.font);
+  popover.style.fontFamily = option.css;
+  popover.style.setProperty("--popover-font-scale", String(getReadingFontScale(settings)));
+  popover.style.setProperty("--popover-line-height", String(getReadingLineHeight(settings)));
+}
+
+function getPopoverElementByKey(key) {
+  if (!key) return null;
+  return document.querySelector(`.source-popover[data-popover-key="${CSS.escape(key)}"]`);
+}
+
+function updatePopoverCustomizeButtons() {
+  document.querySelectorAll(".customize-popover").forEach((button) => {
+    const popover = button.closest(".source-popover");
+    button.classList.toggle("active", Boolean(popover?.dataset.popoverKey && popover.dataset.popoverKey === state.customizingPopoverKey));
+  });
+}
+
+function enterPopoverCustomization(popover) {
+  const key = popover.dataset.popoverKey;
+  if (!key) return;
+  state.customizingPopoverKey = key;
+  if (!state.popoverSettings[key]) {
+    state.popoverSettings[key] = getGlobalReadingSettings();
+  }
+  els.readingSettingsPanel?.classList.add("customizing");
+  if (els.settingsModeLabel) els.settingsModeLabel.textContent = "Text window settings";
+  if (els.settingsDoneButton) els.settingsDoneButton.hidden = false;
+  syncSettingsControls();
+  updatePopoverCustomizeButtons();
+}
+
+function exitPopoverCustomization() {
+  state.customizingPopoverKey = "";
+  els.readingSettingsPanel?.classList.remove("customizing");
+  if (els.settingsModeLabel) els.settingsModeLabel.textContent = "Reading settings";
+  if (els.settingsDoneButton) els.settingsDoneButton.hidden = true;
+  syncSettingsControls();
+  updatePopoverCustomizeButtons();
+}
+
+function updateLocalPopoverSettings(partial) {
+  const key = state.customizingPopoverKey;
+  if (!key) return;
+  const current = getPopoverSettings(key) || getGlobalReadingSettings();
+  const next = {
+    font: partial.font && FONT_OPTIONS[partial.font] ? partial.font : current.font,
+    textSize: partial.textSize !== undefined
+      ? clampValue(Number(partial.textSize) || current.textSize, 90, 116)
+      : current.textSize,
+    lineDistance: partial.lineDistance !== undefined
+      ? clampValue(Number(partial.lineDistance) || current.lineDistance, 120, 175)
+      : current.lineDistance,
+  };
+  state.popoverSettings[key] = next;
+  const popover = getPopoverElementByKey(key);
+  if (popover) applyPopoverReadingSettings(popover);
+  syncSettingsControls();
+}
+
+function resetPopoverState() {
+  state.popoverSettings = {};
+  if (state.customizingPopoverKey) exitPopoverCustomization();
 }
 
 function showPopover(anchor, text) {
@@ -3444,6 +3666,15 @@ function showPopover(anchor, text) {
   popover.dataset.popoverKey = key;
   popover.tabIndex = -1;
   popover.querySelector("p").textContent = text;
+  const customizeButton = popover.querySelector(".customize-popover");
+  customizeButton.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (state.customizingPopoverKey === key) {
+      exitPopoverCustomization();
+    } else {
+      enterPopoverCustomization(popover);
+    }
+  });
   popover.querySelector(".close-popover").addEventListener("click", (event) => {
     event.stopPropagation();
     closePopover(popover);
@@ -3452,6 +3683,8 @@ function showPopover(anchor, text) {
   popover.addEventListener("pointerdown", (event) => event.stopPropagation());
 
   container.append(connector, popover);
+  applyPopoverReadingSettings(popover);
+  updatePopoverCustomizeButtons();
 
   const anchorPoint = getAnchorPoint(anchor, container);
   const maxLeft = Math.max(8, container.offsetWidth - popover.offsetWidth - 8);
@@ -3486,6 +3719,7 @@ async function handleFile(file, options = {}) {
     state.objectId = null;
     state.annotations = [];
     state.summaryData = null;
+    resetPopoverState();
     els.processButton.disabled = true;
     els.pages.innerHTML = "";
     els.fileName.textContent = file.name || "None";
@@ -3500,6 +3734,7 @@ async function handleFile(file, options = {}) {
   state.objectId = null;
   state.annotations = [];
   state.summaryData = null;
+  resetPopoverState();
   els.processButton.disabled = true;
   els.pages.innerHTML = "";
   setStatus(fileKind === "pdf"
@@ -3551,6 +3786,7 @@ async function processCurrentDocument() {
   els.processButton.disabled = true;
   try {
     state.objectId = null;
+    resetPopoverState();
     await summarizeDocument();
     if (state.fileKind === "docx") {
       renderDocumentView();
@@ -3567,6 +3803,7 @@ async function processCurrentDocument() {
 
 async function renderSample() {
   await loadSelectedFont();
+  resetPopoverState();
   const width = 860;
   const height = 620;
   state.pdf = null;
@@ -3610,13 +3847,15 @@ async function renderSample() {
   canvas.width = width;
   canvas.height = height;
   const ctx = canvas.getContext("2d");
+  const readingFontScale = getReadingFontScale();
+  const sampleLineHeight = 22 * (getReadingLineHeight() / (DEFAULT_READING_SETTINGS.lineDistance / 100));
   ctx.fillStyle = "#fff";
   ctx.fillRect(0, 0, width, height);
   ctx.fillStyle = "#1f2933";
-  ctx.font = getCanvasFont(800, 34);
+  ctx.font = getCanvasFont(800, 34 * readingFontScale);
   ctx.fillText("History Notes", 82, 92);
-  ctx.font = getCanvasFont(400, 15);
-  wrapCanvasText(ctx, sampleText, 82, 150, 690, 22);
+  ctx.font = getCanvasFont(400, 15 * readingFontScale);
+  wrapCanvasText(ctx, sampleText, 82, 150, 690, sampleLineHeight);
   const positionedAnnotations = layoutReplacementAnnotations(state.pages[0], state.annotations, ctx);
   clearReplacementRegions(ctx, positionedAnnotations);
   drawReplacementTexts(ctx, positionedAnnotations);
@@ -3721,7 +3960,7 @@ function enableExtractionDebugApi() {
 
 enableExtractionDebugApi();
 if (!FONT_OPTIONS[state.selectedFont]) state.selectedFont = "lexend";
-applySelectedFont();
+applyReadingSettings();
 loadSelectedFont().catch((error) => console.warn("Could not preload selected font", error));
 
 els.input.addEventListener("change", (event) => handleFile(event.target.files[0]));
@@ -3736,11 +3975,36 @@ els.sampleButton.addEventListener("click", () => {
 els.zoomIn.addEventListener("click", () => setZoom(state.scale + 0.1));
 els.zoomOut.addEventListener("click", () => setZoom(state.scale - 0.1));
 els.fontSelect.addEventListener("change", (event) => {
-  updateSelectedFont(event.target.value).catch((error) => {
+  if (state.customizingPopoverKey) {
+    updateLocalPopoverSettings({ font: event.target.value });
+    return;
+  }
+  updateGlobalReadingSettings({ font: event.target.value }, true).catch((error) => {
     console.error(error);
     setStatus("Font changed, but the preview could not be redrawn.", 0);
   });
 });
+els.textSizeRange.addEventListener("input", (event) => {
+  if (state.customizingPopoverKey) {
+    updateLocalPopoverSettings({ textSize: event.target.value });
+    return;
+  }
+  updateGlobalReadingSettings({ textSize: event.target.value }).catch((error) => {
+    console.error(error);
+    setStatus("Text size changed, but the preview could not be redrawn.", 0);
+  });
+});
+els.lineDistanceRange.addEventListener("input", (event) => {
+  if (state.customizingPopoverKey) {
+    updateLocalPopoverSettings({ lineDistance: event.target.value });
+    return;
+  }
+  updateGlobalReadingSettings({ lineDistance: event.target.value }).catch((error) => {
+    console.error(error);
+    setStatus("Line distance changed, but the preview could not be redrawn.", 0);
+  });
+});
+els.settingsDoneButton.addEventListener("click", exitPopoverCustomization);
 els.modelSelect.addEventListener("change", () => {
   state.selectedModel = els.modelSelect.value || DEFAULT_MODEL;
   const selected = state.models.find((model) => model.id === state.selectedModel);
