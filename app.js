@@ -2228,7 +2228,7 @@ function isReadableSourceBlock(item) {
 function isDocxSourceCandidate(item) {
   return Boolean(item?.fromDocx)
     && item.kind === "paragraph"
-    && countWords(item.text || "") >= 25
+    && countWords(item.text || "") >= 8
     && countSentences(item.text || "") >= 1
     && !isLikelyHeaderBlock(item);
 }
