@@ -11,10 +11,10 @@
     <main class="app-shell">
       <aside class="sidebar">
         <div class="brand">
-          <div class="mark">P</div>
+          <div class="mark">D</div>
           <div>
             <h1>Document Annotator</h1>
-            <p>Turn dense PDFs and Word documents into clickable presentation pages.</p>
+            <p>Turn dense PDFs, Word documents, and Google Docs into clickable presentation pages.</p>
           </div>
         </div>
 
@@ -23,6 +23,14 @@
           <span class="drop-title">Upload Document</span>
           <span class="drop-meta">PDF or DOCX, 10 MB max</span>
         </label>
+
+        <form class="google-doc-import" id="googleDocForm">
+          <label for="googleDocUrl">Google Docs link</label>
+          <div class="google-doc-row">
+            <input id="googleDocUrl" type="url" placeholder="https://docs.google.com/document/d/..." autocomplete="off" />
+            <button id="googleDocButton" type="submit">Import</button>
+          </div>
+        </form>
 
         <button class="primary-action" id="processButton" disabled>Transform Document</button>
         <button class="secondary-action" id="sampleButton">Try Sample Text</button>
@@ -76,7 +84,7 @@
         <div class="pages" id="pages">
           <div class="empty-state">
             <h3>No document loaded</h3>
-            <p>Upload a PDF or Word document, then transform it into an annotated presentation.</p>
+            <p>Upload a PDF, Word document, or Google Doc, then transform it into an annotated presentation.</p>
           </div>
         </div>
       </section>

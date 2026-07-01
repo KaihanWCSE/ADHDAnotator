@@ -24,7 +24,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -107,6 +108,49 @@ p {
 .drop-title {
   font-weight: 800;
   font-size: 18px;
+}
+
+.google-doc-import {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.google-doc-import label {
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.google-doc-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 82px;
+  gap: 8px;
+}
+
+.google-doc-row input,
+.google-doc-row button {
+  min-width: 0;
+  height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.google-doc-row input {
+  padding: 0 11px;
+  color: var(--ink);
+  background: white;
+}
+
+.google-doc-row button {
+  color: var(--ink);
+  background: #eef2f6;
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.google-doc-row button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
 }
 
 .primary-action,

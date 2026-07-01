@@ -3,6 +3,7 @@ const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
 const TESSERACT_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
 const MAMMOTH_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/mammoth@1.9.1/mammoth.browser.min.js";
+const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
 const MAX_DOCX_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MODEL = "openai/gpt-4.1-mini";
@@ -43,6 +44,7 @@ const state = {
   objectId: null,
   models: [],
   selectedModel: DEFAULT_MODEL,
+  fileSource: "",
   extractionMode: "text",
   ocrApplied: false,
   ocrUnavailableReason: "",
@@ -52,6 +54,9 @@ const state = {
 const els = {
   input: document.getElementById("pdfInput"),
   dropZone: document.getElementById("dropZone"),
+  googleDocForm: document.getElementById("googleDocForm"),
+  googleDocUrl: document.getElementById("googleDocUrl"),
+  googleDocButton: document.getElementById("googleDocButton"),
   processButton: document.getElementById("processButton"),
   sampleButton: document.getElementById("sampleButton"),
   pages: document.getElementById("pages"),
@@ -130,7 +135,7 @@ function isPdfFile(file) {
 }
 
 function isDocxFile(file) {
-  return file?.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  return file?.type === DOCX_MIME
     || /\.docx$/i.test(file?.name || "");
 }
 
@@ -142,6 +147,61 @@ function setStatus(text, progress) {
   els.statusText.textContent = text;
   if (typeof progress === "number") {
     els.progressBar.style.width = `${Math.max(0, Math.min(100, progress))}%`;
+  }
+}
+
+function setGoogleDocImportDisabled(disabled) {
+  if (els.googleDocButton) els.googleDocButton.disabled = disabled;
+  if (els.googleDocUrl) els.googleDocUrl.disabled = disabled;
+}
+
+function normalizeDocxFilename(filename, fallback = "google-doc.docx") {
+  const cleaned = String(filename || fallback)
+    .replace(/[\\/:*?"<>|]+/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+  const base = cleaned || fallback;
+  return /\.docx$/i.test(base) ? base : `${base}.docx`;
+}
+
+async function importGoogleDocFromUrl(url) {
+  const response = await fetch(`${API_BASE}/fn/import-google-doc`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  if (!response.ok) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.error || "Could not import Google Doc.");
+  }
+
+  const buffer = await response.arrayBuffer();
+  if (!buffer.byteLength) throw new Error("Google Doc import returned no document data.");
+  const encodedFilename = response.headers.get("X-Document-Filename") || "";
+  const filename = encodedFilename ? decodeURIComponent(encodedFilename) : "google-doc.docx";
+  return new File([buffer], normalizeDocxFilename(filename), {
+    type: response.headers.get("Content-Type") || DOCX_MIME,
+  });
+}
+
+async function handleGoogleDocImport(event) {
+  event.preventDefault();
+  const url = els.googleDocUrl?.value?.trim() || "";
+  if (!url) {
+    setStatus("Paste a Google Docs link to import.", 0);
+    return;
+  }
+  setGoogleDocImportDisabled(true);
+  els.processButton.disabled = true;
+  setStatus("Importing Google Doc...", 4);
+  try {
+    const file = await importGoogleDocFromUrl(url);
+    await handleFile(file, { source: "google-doc" });
+  } catch (error) {
+    console.error(error);
+    setStatus(error.message || "Could not import Google Doc.", 0);
+  } finally {
+    setGoogleDocImportDisabled(false);
   }
 }
 
@@ -3201,9 +3261,9 @@ function refreshCounters() {
   els.paragraphCount.textContent = String(getSourceItems().length);
 }
 
-async function handleFile(file) {
+async function handleFile(file, options = {}) {
   if (!file || (!isPdfFile(file) && !isDocxFile(file))) {
-    setStatus("Choose a valid PDF or Word document.", 0);
+    setStatus("Choose a valid PDF, Word document, or Google Doc.", 0);
     return;
   }
   const fileKind = isPdfFile(file) ? "pdf" : "docx";
@@ -3211,6 +3271,7 @@ async function handleFile(file) {
   if (file.size < 1 || file.size > maxBytes) {
     state.file = null;
     state.fileKind = "";
+    state.fileSource = "";
     state.pdf = null;
     state.pages = [];
     state.objectId = null;
@@ -3226,12 +3287,17 @@ async function handleFile(file) {
   }
   state.file = file;
   state.fileKind = fileKind;
+  state.fileSource = options.source || fileKind;
   state.objectId = null;
   state.annotations = [];
   state.summaryData = null;
   els.processButton.disabled = true;
   els.pages.innerHTML = "";
-  setStatus(fileKind === "pdf" ? "Loading PDF..." : "Loading Word document...", 5);
+  setStatus(fileKind === "pdf"
+    ? "Loading PDF..."
+    : state.fileSource === "google-doc"
+    ? "Loading Google Doc..."
+    : "Loading Word document...", 5);
   try {
     const parseResult = fileKind === "pdf" ? await parsePdf(file) : await parseDocx(file);
     refreshCounters();
@@ -3259,7 +3325,9 @@ async function handleFile(file) {
     }
 
     setStatus(fileKind === "docx"
-      ? "Word document ready. Transform it when you are ready."
+      ? state.fileSource === "google-doc"
+        ? "Google Doc ready. Transform it when you are ready."
+        : "Word document ready. Transform it when you are ready."
       : parseResult.ocrApplied
       ? "OCR complete. PDF ready. Transform it when you are ready."
       : "PDF ready. Transform it when you are ready.", 45);
@@ -3293,6 +3361,8 @@ function renderSample() {
   const height = 620;
   state.pdf = null;
   state.file = { name: "civil-war-sample.pdf" };
+  state.fileKind = "sample";
+  state.fileSource = "sample";
   state.pages = [{
     pageNumber: 1,
     width,
@@ -3442,6 +3512,7 @@ function enableExtractionDebugApi() {
 enableExtractionDebugApi();
 
 els.input.addEventListener("change", (event) => handleFile(event.target.files[0]));
+els.googleDocForm.addEventListener("submit", handleGoogleDocImport);
 els.processButton.addEventListener("click", processCurrentDocument);
 els.sampleButton.addEventListener("click", renderSample);
 els.zoomIn.addEventListener("click", () => setZoom(state.scale + 0.1));
