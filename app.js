@@ -142,6 +142,13 @@ const state = {
 };
 
 const els = {
+  operationPage: document.getElementById("operationPage"),
+  authPage: document.getElementById("authPage"),
+  accountPage: document.getElementById("accountPage"),
+  operationNavButton: document.getElementById("operationNavButton"),
+  accountNavButton: document.getElementById("accountNavButton"),
+  loginNavButton: document.getElementById("loginNavButton"),
+  signupNavButton: document.getElementById("signupNavButton"),
   input: document.getElementById("pdfInput"),
   dropZone: document.getElementById("dropZone"),
   googleDocForm: document.getElementById("googleDocForm"),
@@ -163,12 +170,17 @@ const els = {
   modelSelect: document.getElementById("modelSelect"),
   headerColorGrid: document.getElementById("headerColorGrid"),
   bulletColorGrid: document.getElementById("bulletColorGrid"),
+  headerColorTrigger: document.getElementById("headerColorTrigger"),
+  bulletColorTrigger: document.getElementById("bulletColorTrigger"),
+  headerColorDropdown: document.getElementById("headerColorDropdown"),
+  bulletColorDropdown: document.getElementById("bulletColorDropdown"),
   headerColorInput: document.getElementById("headerColorInput"),
   bulletColorInput: document.getElementById("bulletColorInput"),
   headerHexInput: document.getElementById("headerHexInput"),
   bulletHexInput: document.getElementById("bulletHexInput"),
   loginTab: document.getElementById("loginTab"),
   signupTab: document.getElementById("signupTab"),
+  authPageTitle: document.getElementById("authPageTitle"),
   authForm: document.getElementById("authForm"),
   authEmail: document.getElementById("authEmail"),
   authPassword: document.getElementById("authPassword"),
@@ -177,9 +189,10 @@ const els = {
   verifyForm: document.getElementById("verifyForm"),
   verifyEmail: document.getElementById("verifyEmail"),
   verifyCode: document.getElementById("verifyCode"),
+  accountPageSubtitle: document.getElementById("accountPageSubtitle"),
   accountSession: document.getElementById("accountSession"),
   accountEmail: document.getElementById("accountEmail"),
-  logoutButton: document.getElementById("logoutButton"),
+  accountStatus: document.getElementById("accountStatus"),
   membershipButton: document.getElementById("membershipButton"),
   authStatus: document.getElementById("authStatus"),
   readingSettingsPanel: document.getElementById("readingSettingsPanel"),
@@ -367,6 +380,27 @@ function syncColorControls() {
   });
 }
 
+function closeColorDropdowns(except = null) {
+  [
+    [els.headerColorDropdown, els.headerColorTrigger],
+    [els.bulletColorDropdown, els.bulletColorTrigger],
+  ].forEach(([dropdown, trigger]) => {
+    if (!dropdown || dropdown === except) return;
+    dropdown.hidden = true;
+    trigger?.setAttribute("aria-expanded", "false");
+  });
+}
+
+function toggleColorDropdown(target) {
+  const dropdown = target === "header" ? els.headerColorDropdown : els.bulletColorDropdown;
+  const trigger = target === "header" ? els.headerColorTrigger : els.bulletColorTrigger;
+  if (!dropdown || !trigger) return;
+  const shouldOpen = dropdown.hidden;
+  closeColorDropdowns(shouldOpen ? dropdown : null);
+  dropdown.hidden = !shouldOpen;
+  trigger.setAttribute("aria-expanded", String(shouldOpen));
+}
+
 function renderColorGrid(container, target) {
   if (!container) return;
   container.innerHTML = "";
@@ -383,6 +417,7 @@ function renderColorGrid(container, target) {
         console.error(error);
         setStatus("Color changed, but the preview could not be redrawn.", 0);
       });
+      closeColorDropdowns();
     });
     container.appendChild(button);
   });
@@ -4030,6 +4065,27 @@ function setZoom(nextScale) {
 
 function setAuthStatus(message) {
   if (els.authStatus) els.authStatus.textContent = message;
+  if (els.accountStatus) els.accountStatus.textContent = message;
+}
+
+function showPage(pageName) {
+  [
+    ["operation", els.operationPage],
+    ["auth", els.authPage],
+    ["account", els.accountPage],
+  ].forEach(([name, page]) => {
+    if (!page) return;
+    const active = name === pageName;
+    page.hidden = !active;
+    page.classList.toggle("active", active);
+  });
+  window.scrollTo(0, 0);
+  refreshVisiblePopoverConnectors();
+}
+
+function showAuthPage(mode = "login") {
+  setAuthMode(mode);
+  showPage("auth");
 }
 
 function persistAuthSession(data) {
@@ -4055,7 +4111,14 @@ function renderAuthState() {
   if (els.verifyForm) els.verifyForm.hidden = signedIn;
   if (els.accountSession) els.accountSession.hidden = !signedIn;
   if (els.accountEmail) els.accountEmail.textContent = state.auth.user?.email || "";
-  if (els.membershipButton) els.membershipButton.disabled = false;
+  if (els.accountPageSubtitle) {
+    els.accountPageSubtitle.textContent = signedIn
+      ? "Manage your account and membership."
+      : "Log in or sign up to manage your account.";
+  }
+  if (els.signupNavButton) els.signupNavButton.hidden = signedIn;
+  if (els.loginNavButton) els.loginNavButton.textContent = signedIn ? "Log out" : "Log in";
+  if (els.membershipButton) els.membershipButton.disabled = !signedIn;
   if (signedIn) {
     const subscription = state.auth.subscription;
     const active = subscription && ["active", "trialing"].includes(String(subscription.status || "").toLowerCase());
@@ -4114,6 +4177,7 @@ function setAuthMode(mode) {
   state.authMode = mode;
   els.loginTab?.classList.toggle("active", mode === "login");
   els.signupTab?.classList.toggle("active", mode === "signup");
+  if (els.authPageTitle) els.authPageTitle.textContent = mode === "signup" ? "Sign up" : "Log in";
   if (els.authName) els.authName.hidden = mode !== "signup";
   if (els.authSubmit) els.authSubmit.textContent = mode === "signup" ? "Create account" : "Log in";
   if (els.authPassword) els.authPassword.autocomplete = mode === "signup" ? "new-password" : "current-password";
@@ -4142,6 +4206,7 @@ async function handleAuthSubmit(event) {
     persistAuthSession(session);
     await loadSubscriptionStatus();
     renderAuthState();
+    showPage("account");
   } catch (error) {
     setAuthStatus(error.message || "Account request failed.");
   } finally {
@@ -4179,6 +4244,7 @@ async function logout() {
 async function startMembershipCheckout() {
   if (!state.auth.accessToken) {
     setAuthStatus("Log in before starting membership checkout.");
+    showAuthPage("login");
     return;
   }
   try {
@@ -4284,6 +4350,16 @@ setAuthMode("login");
 renderAuthState();
 loadCurrentUser();
 
+els.operationNavButton.addEventListener("click", () => showPage("operation"));
+els.accountNavButton.addEventListener("click", () => showPage("account"));
+els.loginNavButton.addEventListener("click", () => {
+  if (state.auth.user && state.auth.accessToken) {
+    logout();
+    return;
+  }
+  showAuthPage("login");
+});
+els.signupNavButton.addEventListener("click", () => showAuthPage("signup"));
 els.input.addEventListener("change", (event) => handleFile(event.target.files[0]));
 els.googleDocForm.addEventListener("submit", handleGoogleDocImport);
 els.processButton.addEventListener("click", processCurrentDocument);
@@ -4344,11 +4420,16 @@ els.bulletHexInput.addEventListener("change", (event) => {
     setStatus("Bullet color changed, but the preview could not be redrawn.", 0);
   });
 });
+els.headerColorTrigger.addEventListener("click", () => toggleColorDropdown("header"));
+els.bulletColorTrigger.addEventListener("click", () => toggleColorDropdown("bullet"));
+document.addEventListener("click", (event) => {
+  if (event.target.closest(".color-setting")) return;
+  closeColorDropdowns();
+});
 els.loginTab.addEventListener("click", () => setAuthMode("login"));
 els.signupTab.addEventListener("click", () => setAuthMode("signup"));
 els.authForm.addEventListener("submit", handleAuthSubmit);
 els.verifyForm.addEventListener("submit", handleVerifyEmail);
-els.logoutButton.addEventListener("click", logout);
 els.membershipButton.addEventListener("click", startMembershipCheckout);
 els.modelSelect.addEventListener("change", () => {
   state.selectedModel = els.modelSelect.value || DEFAULT_MODEL;

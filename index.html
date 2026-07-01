@@ -8,7 +8,16 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs" type="module"></script>
   </head>
   <body>
-    <main class="app-shell">
+    <header class="top-nav">
+      <button class="nav-brand" id="operationNavButton" type="button">Document Annotator</button>
+      <div class="nav-actions">
+        <button class="nav-button" id="accountNavButton" type="button">Account</button>
+        <button class="nav-button" id="loginNavButton" type="button">Log in</button>
+        <button class="nav-button primary-nav" id="signupNavButton" type="button">Sign up</button>
+      </div>
+    </header>
+
+    <main class="app-shell page-view active" id="operationPage">
       <aside class="sidebar">
         <div class="brand">
           <div class="mark">D</div>
@@ -86,53 +95,36 @@
           <div class="color-setting" data-color-target="header">
             <div class="color-row-title">
               <span><span class="dot header-dot"></span>AI header</span>
+              <button class="color-trigger" id="headerColorTrigger" type="button" aria-expanded="false" aria-controls="headerColorDropdown">
+                <span class="color-preview header-preview"></span>
+              </button>
+            </div>
+            <div class="color-dropdown" id="headerColorDropdown" hidden>
+              <div class="color-grid" id="headerColorGrid" aria-label="AI header color presets"></div>
+              <label class="hex-field" for="headerHexInput">
+                <span>Hex</span>
+                <input id="headerHexInput" type="text" inputmode="text" spellcheck="false" value="#007AFF" />
+              </label>
               <input id="headerColorInput" type="color" value="#007aff" aria-label="Custom AI header color" />
             </div>
-            <div class="color-grid" id="headerColorGrid" aria-label="AI header color presets"></div>
-            <label class="hex-field" for="headerHexInput">
-              <span>Hex</span>
-              <input id="headerHexInput" type="text" inputmode="text" spellcheck="false" value="#007AFF" />
-            </label>
           </div>
           <div class="color-setting" data-color-target="bullet">
             <div class="color-row-title">
               <span><span class="dot bullet-dot"></span>AI bullet</span>
+              <button class="color-trigger" id="bulletColorTrigger" type="button" aria-expanded="false" aria-controls="bulletColorDropdown">
+                <span class="color-preview bullet-preview"></span>
+              </button>
+            </div>
+            <div class="color-dropdown" id="bulletColorDropdown" hidden>
+              <div class="color-grid" id="bulletColorGrid" aria-label="AI bullet color presets"></div>
+              <label class="hex-field" for="bulletHexInput">
+                <span>Hex</span>
+                <input id="bulletHexInput" type="text" inputmode="text" spellcheck="false" value="#FF375F" />
+              </label>
               <input id="bulletColorInput" type="color" value="#ff375f" aria-label="Custom AI bullet color" />
             </div>
-            <div class="color-grid" id="bulletColorGrid" aria-label="AI bullet color presets"></div>
-            <label class="hex-field" for="bulletHexInput">
-              <span>Hex</span>
-              <input id="bulletHexInput" type="text" inputmode="text" spellcheck="false" value="#FF375F" />
-            </label>
           </div>
         </div>
-
-        <section class="account-card" id="accountCard">
-          <div class="settings-heading">
-            <span>Account</span>
-          </div>
-          <div class="auth-tabs" role="group" aria-label="Account mode">
-            <button class="auth-tab active" id="loginTab" type="button">Log in</button>
-            <button class="auth-tab" id="signupTab" type="button">Sign up</button>
-          </div>
-          <form class="auth-form" id="authForm">
-            <input id="authEmail" type="email" placeholder="Email" autocomplete="email" />
-            <input id="authPassword" type="password" placeholder="Password" autocomplete="current-password" />
-            <input id="authName" type="text" placeholder="Name" autocomplete="name" hidden />
-            <button class="primary-action auth-submit" id="authSubmit" type="submit">Log in</button>
-          </form>
-          <form class="auth-form verify-form" id="verifyForm">
-            <input id="verifyEmail" type="email" placeholder="Email for verification" autocomplete="email" />
-            <input id="verifyCode" type="text" placeholder="6-digit code" inputmode="numeric" autocomplete="one-time-code" />
-            <button class="secondary-action auth-submit" type="submit">Verify email</button>
-          </form>
-          <div class="account-session" id="accountSession" hidden>
-            <p id="accountEmail"></p>
-            <button class="secondary-action auth-submit" id="logoutButton" type="button">Log out</button>
-          </div>
-          <button class="primary-action membership-button" id="membershipButton" type="button">Membership - $12/month</button>
-          <p class="auth-status" id="authStatus">Log in to manage membership.</p>
-        </section>
       </aside>
 
       <section class="workspace">
@@ -156,6 +148,48 @@
         </div>
       </section>
     </main>
+
+    <section class="standalone-page page-view" id="authPage" hidden>
+      <div class="page-panel auth-panel">
+        <div>
+          <h2 id="authPageTitle">Log in</h2>
+          <p class="page-subtitle">Use your account to manage membership and future paid features.</p>
+        </div>
+        <div class="auth-tabs" role="group" aria-label="Account mode">
+          <button class="auth-tab active" id="loginTab" type="button">Log in</button>
+          <button class="auth-tab" id="signupTab" type="button">Sign up</button>
+        </div>
+        <form class="auth-form" id="authForm">
+          <input id="authEmail" type="email" placeholder="Email" autocomplete="email" />
+          <input id="authPassword" type="password" placeholder="Password" autocomplete="current-password" />
+          <input id="authName" type="text" placeholder="Name" autocomplete="name" hidden />
+          <button class="primary-action auth-submit" id="authSubmit" type="submit">Log in</button>
+        </form>
+        <form class="auth-form verify-form" id="verifyForm">
+          <input id="verifyEmail" type="email" placeholder="Email for verification" autocomplete="email" />
+          <input id="verifyCode" type="text" placeholder="6-digit code" inputmode="numeric" autocomplete="one-time-code" />
+          <button class="secondary-action auth-submit" type="submit">Verify email</button>
+        </form>
+        <p class="auth-status" id="authStatus">Log in to manage membership.</p>
+      </div>
+    </section>
+
+    <section class="standalone-page page-view" id="accountPage" hidden>
+      <div class="page-panel account-panel">
+        <div>
+          <h2>Account settings</h2>
+          <p class="page-subtitle" id="accountPageSubtitle">Log in to view your account.</p>
+        </div>
+        <div class="account-session" id="accountSession" hidden>
+          <div class="account-detail">
+            <span>Email</span>
+            <strong id="accountEmail"></strong>
+          </div>
+        </div>
+        <button class="primary-action membership-button" id="membershipButton" type="button">Membership - $12/month</button>
+        <p class="auth-status" id="accountStatus">Log in to manage membership.</p>
+      </div>
+    </section>
 
     <template id="popoverTemplate">
       <div class="source-popover">
