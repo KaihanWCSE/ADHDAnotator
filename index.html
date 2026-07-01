@@ -43,6 +43,18 @@
           <small id="modelMeta">Butterbase AI gateway</small>
         </label>
 
+        <label class="font-picker" for="fontSelect">
+          <span>Reading font</span>
+          <select id="fontSelect">
+            <option value="lexend">Lexend</option>
+            <option value="verdana">Verdana</option>
+            <option value="comic-sans">Comic Sans</option>
+            <option value="calibri">Calibri</option>
+            <option value="arial">Arial</option>
+            <option value="opendyslexic">OpenDyslexic</option>
+          </select>
+        </label>
+
         <div class="status-card">
           <div class="status-row">
             <span>Document</span>
@@ -92,8 +104,10 @@
 
     <template id="popoverTemplate">
       <div class="source-popover">
-        <button class="close-popover" aria-label="Close">x</button>
-        <h4>Original Text</h4>
+        <div class="source-popover-header">
+          <h4>Original Text</h4>
+          <button class="close-popover" aria-label="Close">x</button>
+        </div>
         <p></p>
       </div>
     </template>

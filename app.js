@@ -33,6 +33,39 @@ const DEBUG_SOURCE_SEGMENT_RECTS = false;
 const DEBUG_VISUAL_SAMPLING_BANDS = false;
 const DEBUG_VISUAL_SPAN_SAMPLE_BOXES = false;
 
+const FONT_OPTIONS = {
+  lexend: {
+    label: "Lexend",
+    css: "Lexend, Verdana, Arial, sans-serif",
+    canvas: "Lexend, Verdana, Arial, sans-serif",
+  },
+  verdana: {
+    label: "Verdana",
+    css: "Verdana, Geneva, sans-serif",
+    canvas: "Verdana, Geneva, sans-serif",
+  },
+  "comic-sans": {
+    label: "Comic Sans",
+    css: '"Comic Sans MS", "Comic Sans", cursive',
+    canvas: '"Comic Sans MS", "Comic Sans", cursive',
+  },
+  calibri: {
+    label: "Calibri",
+    css: "Calibri, Candara, Segoe, sans-serif",
+    canvas: "Calibri, Candara, Segoe, sans-serif",
+  },
+  arial: {
+    label: "Arial",
+    css: "Arial, Helvetica, sans-serif",
+    canvas: "Arial, Helvetica, sans-serif",
+  },
+  opendyslexic: {
+    label: "OpenDyslexic",
+    css: "OpenDyslexic, Verdana, Arial, sans-serif",
+    canvas: "OpenDyslexic, Verdana, Arial, sans-serif",
+  },
+};
+
 const state = {
   file: null,
   fileKind: "",
@@ -49,6 +82,7 @@ const state = {
   ocrApplied: false,
   ocrUnavailableReason: "",
   ocrSkippedByUser: false,
+  selectedFont: localStorage.getItem("documentAnnotatorFont") || "lexend",
 };
 
 const els = {
@@ -73,6 +107,7 @@ const els = {
   popoverTemplate: document.getElementById("popoverTemplate"),
   modelSelect: document.getElementById("modelSelect"),
   modelMeta: document.getElementById("modelMeta"),
+  fontSelect: document.getElementById("fontSelect"),
   scannedPdfModal: document.getElementById("scannedPdfModal"),
   scannedPdfConfirm: document.getElementById("scannedPdfConfirm"),
   scannedPdfCancel: document.getElementById("scannedPdfCancel"),
@@ -88,6 +123,58 @@ async function loadPdfJs() {
 
 let tesseractLoadPromise = null;
 let mammothLoadPromise = null;
+
+function getSelectedFontOption() {
+  return FONT_OPTIONS[state.selectedFont] || FONT_OPTIONS.lexend;
+}
+
+function getCanvasFontFamily() {
+  return getSelectedFontOption().canvas;
+}
+
+function getCanvasFont(weight, fontSize) {
+  return `${weight} ${fontSize}px ${getCanvasFontFamily()}`;
+}
+
+async function loadSelectedFont() {
+  if (!document.fonts) return;
+  const family = getCanvasFontFamily();
+  await Promise.allSettled([
+    document.fonts.load(`400 16px ${family}`),
+    document.fonts.load(`700 16px ${family}`),
+    document.fonts.load(`800 16px ${family}`),
+  ]);
+}
+
+function applySelectedFont() {
+  const option = getSelectedFontOption();
+  document.documentElement.style.setProperty("--app-font", option.css);
+  if (els.fontSelect) els.fontSelect.value = state.selectedFont;
+}
+
+async function rerenderCurrentOutput() {
+  if (!state.annotations.length) return;
+  await loadSelectedFont();
+  if (state.fileKind === "docx") {
+    renderDocumentView();
+    return;
+  }
+  if (state.fileKind === "pdf" && state.pdf) {
+    await renderPdfPages();
+    return;
+  }
+  if (state.fileKind === "sample") {
+    await renderSample();
+  }
+}
+
+async function updateSelectedFont(nextFont) {
+  if (!FONT_OPTIONS[nextFont]) return;
+  state.selectedFont = nextFont;
+  localStorage.setItem("documentAnnotatorFont", nextFont);
+  applySelectedFont();
+  await rerenderCurrentOutput();
+}
 
 function loadExternalScript(src) {
   return new Promise((resolve, reject) => {
@@ -2793,7 +2880,7 @@ function drawVisualDebugLegend(ctx) {
   const rowHeight = 16;
 
   ctx.save();
-  ctx.font = "10px Inter, Arial, sans-serif";
+  ctx.font = getCanvasFont(400, 10);
   ctx.textBaseline = "middle";
   ctx.fillStyle = "rgba(255, 255, 255, 0.82)";
   ctx.strokeStyle = "rgba(15, 23, 42, 0.2)";
@@ -2878,7 +2965,7 @@ function getLayoutMeasureContext() {
 function getAnnotationLabelWidth(annotation, fontSize) {
   const ctx = getLayoutMeasureContext();
   if (!ctx) return getCanvasLabel(annotation).length * fontSize * 0.58;
-  ctx.font = `650 ${fontSize}px Inter, Arial, sans-serif`;
+  ctx.font = getCanvasFont(650, fontSize);
   return ctx.measureText(getCanvasLabel(annotation)).width;
 }
 
@@ -3083,10 +3170,10 @@ function drawReplacementText(ctx, annotation) {
     ctx.clip();
   }
   ctx.fillStyle = color;
-  ctx.font = `${weight} ${fontSize}px Inter, Arial, sans-serif`;
+  ctx.font = getCanvasFont(weight, fontSize);
   while (fontSize > 8 && ctx.measureText(label).width > annotation.width) {
     fontSize -= 0.5;
-    ctx.font = `${weight} ${fontSize}px Inter, Arial, sans-serif`;
+    ctx.font = getCanvasFont(weight, fontSize);
   }
   const baseline = annotation.y + Math.min(Math.max(fontSize + 2, annotation.height * 0.78), annotation.height - 2);
   ctx.textBaseline = "alphabetic";
@@ -3099,6 +3186,7 @@ function drawReplacementTexts(ctx, annotations) {
 }
 
 async function renderPdfPages() {
+  await loadSelectedFont();
   const pdf = state.pdf;
   els.pages.innerHTML = "";
   for (let i = 1; i <= pdf.numPages; i += 1) {
@@ -3246,15 +3334,134 @@ function createAnnotation(annotation) {
   return button;
 }
 
+function getAnchorPopoverKey(anchor) {
+  if (!anchor.dataset.popoverKey) {
+    anchor.dataset.popoverKey = `popover-${crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`}`;
+  }
+  return anchor.dataset.popoverKey;
+}
+
+function getPopoverContainer(anchor) {
+  return anchor.closest(".page, .document-view") || anchor.parentElement;
+}
+
+function getContainerScale(container) {
+  const width = container.offsetWidth || 1;
+  const rectWidth = container.getBoundingClientRect().width || width;
+  return rectWidth / width || 1;
+}
+
+function getAnchorPoint(anchor, container) {
+  const scale = getContainerScale(container);
+  const anchorRect = anchor.getBoundingClientRect();
+  const containerRect = container.getBoundingClientRect();
+  return {
+    x: (anchorRect.left - containerRect.left) / scale,
+    y: (anchorRect.top - containerRect.top) / scale,
+    width: anchorRect.width / scale,
+    height: anchorRect.height / scale,
+  };
+}
+
+function closePopover(popover) {
+  const key = popover.dataset.popoverKey;
+  if (key) {
+    popover.parentElement?.querySelector(`.popover-connector[data-popover-key="${CSS.escape(key)}"]`)?.remove();
+  }
+  popover.remove();
+}
+
+function updatePopoverConnector(anchor, popover, connector) {
+  const container = getPopoverContainer(anchor);
+  const anchorPoint = getAnchorPoint(anchor, container);
+  const startX = anchorPoint.x;
+  const startY = anchorPoint.y + anchorPoint.height / 2;
+  const popoverLeft = Number.parseFloat(popover.style.left) || 0;
+  const popoverTop = Number.parseFloat(popover.style.top) || 0;
+  const endX = popoverLeft + 18;
+  const endY = popoverTop + 18;
+  const width = Math.hypot(endX - startX, endY - startY);
+  const angle = Math.atan2(endY - startY, endX - startX);
+
+  connector.style.left = `${startX}px`;
+  connector.style.top = `${startY}px`;
+  connector.style.width = `${width}px`;
+  connector.style.transform = `rotate(${angle}rad)`;
+}
+
+function makePopoverDraggable(anchor, popover, connector) {
+  const handle = popover.querySelector(".source-popover-header");
+  if (!handle) return;
+
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.target.closest(".close-popover")) return;
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const container = getPopoverContainer(anchor);
+    const scale = getContainerScale(container);
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startLeft = Number.parseFloat(popover.style.left) || 0;
+    const startTop = Number.parseFloat(popover.style.top) || 0;
+
+    handle.setPointerCapture(event.pointerId);
+
+    const onMove = (moveEvent) => {
+      const nextLeft = startLeft + (moveEvent.clientX - startX) / scale;
+      const nextTop = startTop + (moveEvent.clientY - startY) / scale;
+      popover.style.left = `${Math.max(8, nextLeft)}px`;
+      popover.style.top = `${Math.max(8, nextTop)}px`;
+      updatePopoverConnector(anchor, popover, connector);
+    };
+
+    const onEnd = () => {
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onEnd);
+      handle.removeEventListener("pointercancel", onEnd);
+    };
+
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onEnd);
+    handle.addEventListener("pointercancel", onEnd);
+  });
+}
+
 function showPopover(anchor, text) {
-  document.querySelectorAll(".source-popover").forEach((el) => el.remove());
+  const container = getPopoverContainer(anchor);
+  const key = getAnchorPopoverKey(anchor);
+  const existing = container.querySelector(`.source-popover[data-popover-key="${CSS.escape(key)}"]`);
+  if (existing) {
+    existing.focus();
+    return;
+  }
+
+  const connector = document.createElement("div");
+  connector.className = "popover-connector";
+  connector.dataset.popoverKey = key;
+
   const popover = els.popoverTemplate.content.firstElementChild.cloneNode(true);
+  popover.dataset.popoverKey = key;
+  popover.tabIndex = -1;
   popover.querySelector("p").textContent = text;
-  popover.querySelector(".close-popover").addEventListener("click", () => popover.remove());
-  anchor.parentElement.appendChild(popover);
-  const left = Math.min(anchor.offsetLeft, anchor.parentElement.offsetWidth - 440);
-  popover.style.left = `${Math.max(10, left)}px`;
-  popover.style.top = `${anchor.offsetTop + anchor.offsetHeight + 8}px`;
+  popover.querySelector(".close-popover").addEventListener("click", (event) => {
+    event.stopPropagation();
+    closePopover(popover);
+  });
+  popover.addEventListener("click", (event) => event.stopPropagation());
+  popover.addEventListener("pointerdown", (event) => event.stopPropagation());
+
+  container.append(connector, popover);
+
+  const anchorPoint = getAnchorPoint(anchor, container);
+  const maxLeft = Math.max(8, container.offsetWidth - popover.offsetWidth - 8);
+  const left = Math.min(Math.max(8, anchorPoint.x), maxLeft);
+  const top = anchorPoint.y + anchorPoint.height + 8;
+  popover.style.left = `${left}px`;
+  popover.style.top = `${Math.max(8, top)}px`;
+  updatePopoverConnector(anchor, popover, connector);
+  makePopoverDraggable(anchor, popover, connector);
+  popover.focus({ preventScroll: true });
 }
 
 function refreshCounters() {
@@ -3358,7 +3565,8 @@ async function processCurrentDocument() {
   }
 }
 
-function renderSample() {
+async function renderSample() {
+  await loadSelectedFont();
   const width = 860;
   const height = 620;
   state.pdf = null;
@@ -3405,9 +3613,9 @@ function renderSample() {
   ctx.fillStyle = "#fff";
   ctx.fillRect(0, 0, width, height);
   ctx.fillStyle = "#1f2933";
-  ctx.font = "800 34px Arial";
+  ctx.font = getCanvasFont(800, 34);
   ctx.fillText("History Notes", 82, 92);
-  ctx.font = "15px Arial";
+  ctx.font = getCanvasFont(400, 15);
   wrapCanvasText(ctx, sampleText, 82, 150, 690, 22);
   const positionedAnnotations = layoutReplacementAnnotations(state.pages[0], state.annotations, ctx);
   clearReplacementRegions(ctx, positionedAnnotations);
@@ -3512,19 +3720,32 @@ function enableExtractionDebugApi() {
 }
 
 enableExtractionDebugApi();
+if (!FONT_OPTIONS[state.selectedFont]) state.selectedFont = "lexend";
+applySelectedFont();
+loadSelectedFont().catch((error) => console.warn("Could not preload selected font", error));
 
 els.input.addEventListener("change", (event) => handleFile(event.target.files[0]));
 els.googleDocForm.addEventListener("submit", handleGoogleDocImport);
 els.processButton.addEventListener("click", processCurrentDocument);
-els.sampleButton.addEventListener("click", renderSample);
+els.sampleButton.addEventListener("click", () => {
+  renderSample().catch((error) => {
+    console.error(error);
+    setStatus("Could not render sample.", 0);
+  });
+});
 els.zoomIn.addEventListener("click", () => setZoom(state.scale + 0.1));
 els.zoomOut.addEventListener("click", () => setZoom(state.scale - 0.1));
+els.fontSelect.addEventListener("change", (event) => {
+  updateSelectedFont(event.target.value).catch((error) => {
+    console.error(error);
+    setStatus("Font changed, but the preview could not be redrawn.", 0);
+  });
+});
 els.modelSelect.addEventListener("change", () => {
   state.selectedModel = els.modelSelect.value || DEFAULT_MODEL;
   const selected = state.models.find((model) => model.id === state.selectedModel);
   els.modelMeta.textContent = selected ? formatModelPrice(selected) : "Butterbase AI gateway";
 });
-document.addEventListener("click", () => document.querySelectorAll(".source-popover").forEach((el) => el.remove()));
 
 ["dragenter", "dragover"].forEach((eventName) => {
   els.dropZone.addEventListener(eventName, (event) => {
