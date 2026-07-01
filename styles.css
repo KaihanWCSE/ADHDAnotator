@@ -300,7 +300,8 @@ p {
 }
 
 .status-card,
-.legend {
+.legend,
+.account-card {
   margin-top: 22px;
   padding: 16px;
   border: 1px solid var(--line);
@@ -340,8 +341,76 @@ p {
 
 .legend {
   display: grid;
-  gap: 10px;
+  gap: 16px;
   font-size: 14px;
+}
+
+.color-setting {
+  display: grid;
+  gap: 10px;
+}
+
+.color-row-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 750;
+}
+
+.color-row-title input[type="color"] {
+  width: 34px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  overflow: hidden;
+  background: transparent;
+  cursor: pointer;
+}
+
+.color-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 8px;
+}
+
+.color-swatch {
+  width: 100%;
+  aspect-ratio: 1;
+  min-height: 26px;
+  border: 2px solid rgba(255, 255, 255, 0.88);
+  border-radius: 999px;
+  box-shadow: 0 0 0 1px rgba(60, 60, 67, 0.18);
+  cursor: pointer;
+}
+
+.color-swatch.active {
+  box-shadow: 0 0 0 2px white, 0 0 0 5px var(--blue);
+}
+
+.hex-field {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.hex-field span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.hex-field input {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink);
+  background: white;
+  font-size: 13px;
 }
 
 .dot {
@@ -755,6 +824,68 @@ p {
   height: 16px;
   display: block;
   fill: currentColor;
+}
+
+.customize-popover svg {
+  transform: translateX(-1px);
+}
+
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  padding: 4px;
+  border-radius: 12px;
+  background: rgba(118, 118, 128, 0.12);
+}
+
+.auth-tab {
+  height: 32px;
+  border: 0;
+  border-radius: 10px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.auth-tab.active {
+  color: var(--ink);
+  background: white;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.08);
+}
+
+.account-card,
+.auth-form,
+.account-session {
+  display: grid;
+  gap: 10px;
+}
+
+.auth-form input {
+  width: 100%;
+  height: 38px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--ink);
+  background: white;
+}
+
+.verify-form {
+  padding-top: 2px;
+}
+
+.auth-submit,
+.membership-button {
+  margin-top: 0;
+}
+
+.account-session p,
+.auth-status {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .popover-connector {

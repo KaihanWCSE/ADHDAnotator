@@ -1,5 +1,6 @@
 const APP_ID = "app_jnnlkgx7ehdy";
 const API_BASE = "https://api.butterbase.ai/v1/app_jnnlkgx7ehdy";
+const AUTH_BASE = `https://api.butterbase.ai/auth/${APP_ID}`;
 const PDFJS_URL = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs";
 const TESSERACT_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
 const MAMMOTH_SCRIPT_URL = "https://cdn.jsdelivr.net/npm/mammoth@1.9.1/mammoth.browser.min.js";
@@ -73,15 +74,29 @@ const DEFAULT_READING_SETTINGS = {
 };
 
 const COLOR_OPTIONS = {
-  blue: "#007aff",
-  teal: "#0f766e",
-  purple: "#7c3aed",
-  black: "#1d1d1f",
-  green: "#248a3d",
-  rose: "#ff375f",
-  red: "#ff3b30",
-  orange: "#ff9500",
+  blue: "#007AFF",
+  teal: "#5AC8FA",
+  purple: "#AF52DE",
+  black: "#000000",
+  white: "#FFFFFF",
+  green: "#34C759",
+  rose: "#FF375F",
+  red: "#FF3B30",
+  orange: "#FF9500",
+  yellow: "#FFCC00",
+  gray: "#8E8E93",
+  brown: "#8E6E53",
+  indigo: "#5856D6",
+  mint: "#00C7BE",
 };
+
+const COLOR_PRESETS = [
+  "#000000", "#FFFFFF", "#E4573D", "#D63B6A", "#8E3AB9",
+  "#6544C4", "#4A5BBE", "#007AFF", "#55ACEE", "#5DB8CE",
+  "#4D9C90", "#6EAF5A", "#9BC451", "#D4DF3F", "#FFE94A",
+  "#FFCC00", "#F6A21A", "#F2692E", "#7A5C4B", "#A3A3A3",
+  "#708696",
+];
 
 function clampValue(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -112,11 +127,18 @@ const state = {
   selectedFont: localStorage.getItem("documentAnnotatorFont") || DEFAULT_READING_SETTINGS.font,
   textSize: getStoredNumber("documentAnnotatorTextSize", DEFAULT_READING_SETTINGS.textSize, 50, 200),
   lineDistance: getStoredNumber("documentAnnotatorLineDistance", DEFAULT_READING_SETTINGS.lineDistance, 100, 300),
-  headerColor: localStorage.getItem("documentAnnotatorHeaderColor") || "blue",
-  bulletColor: localStorage.getItem("documentAnnotatorBulletColor") || "rose",
+  headerColor: localStorage.getItem("documentAnnotatorHeaderColor") || COLOR_OPTIONS.blue,
+  bulletColor: localStorage.getItem("documentAnnotatorBulletColor") || COLOR_OPTIONS.rose,
   popoverSettings: {},
   customizingPopoverKey: "",
   settingsRenderTimer: null,
+  authMode: "login",
+  auth: {
+    accessToken: localStorage.getItem("documentAnnotatorAccessToken") || "",
+    refreshToken: localStorage.getItem("documentAnnotatorRefreshToken") || "",
+    user: null,
+    subscription: null,
+  },
 };
 
 const els = {
@@ -126,7 +148,6 @@ const els = {
   googleDocUrl: document.getElementById("googleDocUrl"),
   googleDocButton: document.getElementById("googleDocButton"),
   processButton: document.getElementById("processButton"),
-  sampleButton: document.getElementById("sampleButton"),
   pages: document.getElementById("pages"),
   fileName: document.getElementById("fileName"),
   pageCount: document.getElementById("pageCount"),
@@ -140,9 +161,27 @@ const els = {
   zoomLabel: document.getElementById("zoomLabel"),
   popoverTemplate: document.getElementById("popoverTemplate"),
   modelSelect: document.getElementById("modelSelect"),
-  modelMeta: document.getElementById("modelMeta"),
-  headerColorSelect: document.getElementById("headerColorSelect"),
-  bulletColorSelect: document.getElementById("bulletColorSelect"),
+  headerColorGrid: document.getElementById("headerColorGrid"),
+  bulletColorGrid: document.getElementById("bulletColorGrid"),
+  headerColorInput: document.getElementById("headerColorInput"),
+  bulletColorInput: document.getElementById("bulletColorInput"),
+  headerHexInput: document.getElementById("headerHexInput"),
+  bulletHexInput: document.getElementById("bulletHexInput"),
+  loginTab: document.getElementById("loginTab"),
+  signupTab: document.getElementById("signupTab"),
+  authForm: document.getElementById("authForm"),
+  authEmail: document.getElementById("authEmail"),
+  authPassword: document.getElementById("authPassword"),
+  authName: document.getElementById("authName"),
+  authSubmit: document.getElementById("authSubmit"),
+  verifyForm: document.getElementById("verifyForm"),
+  verifyEmail: document.getElementById("verifyEmail"),
+  verifyCode: document.getElementById("verifyCode"),
+  accountSession: document.getElementById("accountSession"),
+  accountEmail: document.getElementById("accountEmail"),
+  logoutButton: document.getElementById("logoutButton"),
+  membershipButton: document.getElementById("membershipButton"),
+  authStatus: document.getElementById("authStatus"),
   readingSettingsPanel: document.getElementById("readingSettingsPanel"),
   settingsModeLabel: document.getElementById("settingsModeLabel"),
   fontSelect: document.getElementById("fontSelect"),
@@ -191,8 +230,15 @@ function getReadingLineHeight(settings = state) {
   return clampValue(Number(settings.lineDistance) || DEFAULT_READING_SETTINGS.lineDistance, 100, 300) / 100;
 }
 
-function getColorValue(colorKey, fallbackKey) {
-  return COLOR_OPTIONS[colorKey] || COLOR_OPTIONS[fallbackKey] || fallbackKey;
+function normalizeHexColor(value, fallback = "#000000") {
+  const raw = String(value || "").trim();
+  const expanded = raw.replace(/^#?([a-f\d])([a-f\d])([a-f\d])$/i, "#$1$1$2$2$3$3");
+  const withHash = expanded.startsWith("#") ? expanded : `#${expanded}`;
+  return /^#[a-f\d]{6}$/i.test(withHash) ? withHash.toUpperCase() : fallback;
+}
+
+function getColorValue(colorValue, fallbackValue) {
+  return normalizeHexColor(colorValue, normalizeHexColor(fallbackValue, "#000000"));
 }
 
 function getGlobalReadingSettings() {
@@ -238,10 +284,9 @@ function applyReadingSettings() {
   document.documentElement.style.setProperty("--app-font", option.css);
   document.documentElement.style.setProperty("--reading-font-scale", String(getReadingFontScale()));
   document.documentElement.style.setProperty("--reading-line-height", String(getReadingLineHeight()));
-  document.documentElement.style.setProperty("--header-color", getColorValue(state.headerColor, "blue"));
-  document.documentElement.style.setProperty("--bullet-color", getColorValue(state.bulletColor, "rose"));
-  if (els.headerColorSelect) els.headerColorSelect.value = COLOR_OPTIONS[state.headerColor] ? state.headerColor : "blue";
-  if (els.bulletColorSelect) els.bulletColorSelect.value = COLOR_OPTIONS[state.bulletColor] ? state.bulletColor : "rose";
+  document.documentElement.style.setProperty("--header-color", getColorValue(state.headerColor, COLOR_OPTIONS.blue));
+  document.documentElement.style.setProperty("--bullet-color", getColorValue(state.bulletColor, COLOR_OPTIONS.rose));
+  syncColorControls();
   syncSettingsControls();
 }
 
@@ -296,16 +341,51 @@ async function updateGlobalReadingSettings(partial, rerenderImmediately = false)
 }
 
 async function updateAnnotationColors(partial) {
-  if (partial.headerColor && COLOR_OPTIONS[partial.headerColor]) {
-    state.headerColor = partial.headerColor;
+  if (partial.headerColor) {
+    state.headerColor = normalizeHexColor(partial.headerColor, COLOR_OPTIONS.blue);
     localStorage.setItem("documentAnnotatorHeaderColor", state.headerColor);
   }
-  if (partial.bulletColor && COLOR_OPTIONS[partial.bulletColor]) {
-    state.bulletColor = partial.bulletColor;
+  if (partial.bulletColor) {
+    state.bulletColor = normalizeHexColor(partial.bulletColor, COLOR_OPTIONS.rose);
     localStorage.setItem("documentAnnotatorBulletColor", state.bulletColor);
   }
   applyReadingSettings();
   await rerenderCurrentOutput();
+}
+
+function syncColorControls() {
+  const headerColor = getColorValue(state.headerColor, COLOR_OPTIONS.blue);
+  const bulletColor = getColorValue(state.bulletColor, COLOR_OPTIONS.rose);
+  if (els.headerColorInput) els.headerColorInput.value = headerColor;
+  if (els.bulletColorInput) els.bulletColorInput.value = bulletColor;
+  if (els.headerHexInput) els.headerHexInput.value = headerColor;
+  if (els.bulletHexInput) els.bulletHexInput.value = bulletColor;
+  document.querySelectorAll(".color-swatch").forEach((button) => {
+    const target = button.dataset.colorTarget;
+    const activeColor = target === "header" ? headerColor : bulletColor;
+    button.classList.toggle("active", button.dataset.color === activeColor);
+  });
+}
+
+function renderColorGrid(container, target) {
+  if (!container) return;
+  container.innerHTML = "";
+  COLOR_PRESETS.forEach((color) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "color-swatch";
+    button.dataset.colorTarget = target;
+    button.dataset.color = color;
+    button.style.background = color;
+    button.setAttribute("aria-label", `${target} color ${color}`);
+    button.addEventListener("click", () => {
+      updateAnnotationColors(target === "header" ? { headerColor: color } : { bulletColor: color }).catch((error) => {
+        console.error(error);
+        setStatus("Color changed, but the preview could not be redrawn.", 0);
+      });
+    });
+    container.appendChild(button);
+  });
 }
 
 function loadExternalScript(src) {
@@ -3148,8 +3228,8 @@ function layoutReplacementAnnotations(pageData, pageAnnotations, ctx = null) {
   const sourceById = new Map(pageData.items.map((item) => [item.id, item]));
   const readingFontScale = getReadingFontScale();
   const readingLineScale = getReadingLineHeight() / (DEFAULT_READING_SETTINGS.lineDistance / 100);
-  const headerTextColor = getColorValue(state.headerColor, "blue");
-  const bulletTextColor = getColorValue(state.bulletColor, "rose");
+  const headerTextColor = getColorValue(state.headerColor, COLOR_OPTIONS.blue);
+  const bulletTextColor = getColorValue(state.bulletColor, COLOR_OPTIONS.rose);
 
   replacements.forEach(({ source, annotations }) => {
     const lines = getSourceLines(source);
@@ -3292,7 +3372,7 @@ function drawReplacementText(ctx, annotation) {
   const label = (annotation.replacementText || getCanvasLabel(annotation)).trimEnd();
   let fontSize = annotation.fontSize || (annotation.kind === "header" ? 15 : 13);
   const weight = annotation.kind === "header" ? 800 : 650;
-  const color = annotation.textColor || (annotation.kind === "header" ? getColorValue(state.headerColor, "blue") : getColorValue(state.bulletColor, "rose"));
+  const color = annotation.textColor || (annotation.kind === "header" ? getColorValue(state.headerColor, COLOR_OPTIONS.blue) : getColorValue(state.bulletColor, COLOR_OPTIONS.rose));
 
   ctx.save();
   if (annotation.sourceRegion) {
@@ -3948,18 +4028,199 @@ function setZoom(nextScale) {
   });
 }
 
-function formatModelPrice(model) {
-  const input = model.prompt_price_per_mtok;
-  const output = model.completion_price_per_mtok;
-  if (Number.isFinite(input) && Number.isFinite(output)) {
-    const formatPrice = (price) => {
-      if (price >= 10) return price.toFixed(0);
-      if (price >= 1) return price.toFixed(2).replace(/\.?0+$/, "");
-      return price.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
-    };
-    return `$${formatPrice(input)}/M in, $${formatPrice(output)}/M out`;
+function setAuthStatus(message) {
+  if (els.authStatus) els.authStatus.textContent = message;
+}
+
+function persistAuthSession(data) {
+  state.auth.accessToken = data.access_token || "";
+  state.auth.refreshToken = data.refresh_token || "";
+  state.auth.user = data.user || null;
+  localStorage.setItem("documentAnnotatorAccessToken", state.auth.accessToken);
+  localStorage.setItem("documentAnnotatorRefreshToken", state.auth.refreshToken);
+}
+
+function clearAuthSession() {
+  state.auth.accessToken = "";
+  state.auth.refreshToken = "";
+  state.auth.user = null;
+  state.auth.subscription = null;
+  localStorage.removeItem("documentAnnotatorAccessToken");
+  localStorage.removeItem("documentAnnotatorRefreshToken");
+}
+
+function renderAuthState() {
+  const signedIn = Boolean(state.auth.user && state.auth.accessToken);
+  if (els.authForm) els.authForm.hidden = signedIn;
+  if (els.verifyForm) els.verifyForm.hidden = signedIn;
+  if (els.accountSession) els.accountSession.hidden = !signedIn;
+  if (els.accountEmail) els.accountEmail.textContent = state.auth.user?.email || "";
+  if (els.membershipButton) els.membershipButton.disabled = false;
+  if (signedIn) {
+    const subscription = state.auth.subscription;
+    const active = subscription && ["active", "trialing"].includes(String(subscription.status || "").toLowerCase());
+    setAuthStatus(active ? "Membership active." : "Logged in. Membership is optional.");
+  } else {
+    setAuthStatus("Log in to manage membership.");
   }
-  return "Pricing available in Butterbase";
+}
+
+async function authRequest(path, body, options = {}) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  const response = await fetch(`${AUTH_BASE}${path}`, {
+    method: options.method || "POST",
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || data.message || "Account request failed.");
+  return data;
+}
+
+async function loadCurrentUser() {
+  if (!state.auth.accessToken) {
+    renderAuthState();
+    return;
+  }
+  try {
+    const response = await fetch(`${AUTH_BASE}/me`, {
+      headers: { Authorization: `Bearer ${state.auth.accessToken}` },
+    });
+    if (!response.ok) throw new Error("Session expired.");
+    state.auth.user = await response.json();
+    await loadSubscriptionStatus();
+  } catch (error) {
+    console.warn(error);
+    clearAuthSession();
+  }
+  renderAuthState();
+}
+
+async function loadSubscriptionStatus() {
+  if (!state.auth.accessToken) return;
+  try {
+    const response = await fetch(`${API_BASE}/billing/subscription`, {
+      headers: { Authorization: `Bearer ${state.auth.accessToken}` },
+    });
+    if (response.ok) {
+      state.auth.subscription = await response.json();
+    }
+  } catch (error) {
+    console.warn("Could not load subscription status", error);
+  }
+}
+
+function setAuthMode(mode) {
+  state.authMode = mode;
+  els.loginTab?.classList.toggle("active", mode === "login");
+  els.signupTab?.classList.toggle("active", mode === "signup");
+  if (els.authName) els.authName.hidden = mode !== "signup";
+  if (els.authSubmit) els.authSubmit.textContent = mode === "signup" ? "Create account" : "Log in";
+  if (els.authPassword) els.authPassword.autocomplete = mode === "signup" ? "new-password" : "current-password";
+}
+
+async function handleAuthSubmit(event) {
+  event.preventDefault();
+  const email = els.authEmail.value.trim();
+  const password = els.authPassword.value;
+  const displayName = els.authName.value.trim();
+  if (!email || !password) {
+    setAuthStatus("Enter an email and password.");
+    return;
+  }
+
+  try {
+    els.authSubmit.disabled = true;
+    if (state.authMode === "signup") {
+      setAuthStatus("Creating account...");
+      await authRequest("/signup", { email, password, display_name: displayName || undefined });
+      setAuthStatus("Account created. Logging in...");
+    } else {
+      setAuthStatus("Logging in...");
+    }
+    const session = await authRequest("/login", { email, password });
+    persistAuthSession(session);
+    await loadSubscriptionStatus();
+    renderAuthState();
+  } catch (error) {
+    setAuthStatus(error.message || "Account request failed.");
+  } finally {
+    els.authSubmit.disabled = false;
+  }
+}
+
+async function handleVerifyEmail(event) {
+  event.preventDefault();
+  const email = els.verifyEmail.value.trim();
+  const code = els.verifyCode.value.trim();
+  if (!email || !code) {
+    setAuthStatus("Enter the email and verification code.");
+    return;
+  }
+  try {
+    await authRequest("/verify-email", { email, code });
+    setAuthStatus("Email verified. You can log in.");
+  } catch (error) {
+    setAuthStatus(error.message || "Could not verify email.");
+  }
+}
+
+async function logout() {
+  if (state.auth.accessToken) {
+    fetch(`${AUTH_BASE}/logout`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${state.auth.accessToken}` },
+    }).catch(() => {});
+  }
+  clearAuthSession();
+  renderAuthState();
+}
+
+async function startMembershipCheckout() {
+  if (!state.auth.accessToken) {
+    setAuthStatus("Log in before starting membership checkout.");
+    return;
+  }
+  try {
+    els.membershipButton.disabled = true;
+    setAuthStatus("Preparing membership checkout...");
+    const plansResponse = await fetch(`${API_BASE}/billing/plans`);
+    const plansData = await plansResponse.json().catch(() => ({}));
+    if (!plansResponse.ok) throw new Error(plansData.error || "Could not load membership plan.");
+    const plans = Array.isArray(plansData) ? plansData : plansData.plans || [];
+    const getPlanPrice = (item) => Number(item.priceCents ?? item.price_cents);
+    const getPlanInterval = (item) => item.interval || item.billing_interval;
+    const getPlanId = (item) => item.id || item.plan_id;
+    const plan = plans.find((item) => item.active !== false && getPlanInterval(item) === "month" && getPlanPrice(item) === 1200)
+      || plans.find((item) => item.active !== false && /member/i.test(item.name || "") && getPlanInterval(item) === "month");
+    const planId = getPlanId(plan || {});
+    if (!planId) {
+      throw new Error("Membership checkout is not configured yet. Stripe Connect needs a $12/month plan first.");
+    }
+    const response = await fetch(`${API_BASE}/billing/subscribe`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${state.auth.accessToken}`,
+      },
+      body: JSON.stringify({
+        planId,
+        successUrl: window.location.href,
+        cancelUrl: window.location.href,
+      }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "Could not start checkout.");
+    if (data.url) {
+      window.location.href = data.url;
+      return;
+    }
+    throw new Error("Checkout did not return a payment URL.");
+  } catch (error) {
+    setAuthStatus(error.message || "Could not start membership checkout.");
+  } finally {
+    els.membershipButton.disabled = false;
+  }
 }
 
 function populateModelSelect(models) {
@@ -3976,7 +4237,6 @@ function populateModelSelect(models) {
   const defaultExists = state.models.some((model) => model.id === DEFAULT_MODEL);
   state.selectedModel = defaultExists ? DEFAULT_MODEL : state.models[0].id;
   els.modelSelect.value = state.selectedModel;
-  if (els.modelMeta) els.modelMeta.textContent = "";
 }
 
 async function loadModelOptions() {
@@ -3988,7 +4248,6 @@ async function loadModelOptions() {
   } catch (error) {
     console.warn(error);
     populateModelSelect(FALLBACK_MODELS);
-    if (els.modelMeta) els.modelMeta.textContent = "";
   }
 }
 
@@ -4015,18 +4274,19 @@ function enableExtractionDebugApi() {
 
 enableExtractionDebugApi();
 if (!FONT_OPTIONS[state.selectedFont]) state.selectedFont = "lexend";
+state.headerColor = normalizeHexColor(state.headerColor, COLOR_OPTIONS.blue);
+state.bulletColor = normalizeHexColor(state.bulletColor, COLOR_OPTIONS.rose);
+renderColorGrid(els.headerColorGrid, "header");
+renderColorGrid(els.bulletColorGrid, "bullet");
 applyReadingSettings();
 loadSelectedFont().catch((error) => console.warn("Could not preload selected font", error));
+setAuthMode("login");
+renderAuthState();
+loadCurrentUser();
 
 els.input.addEventListener("change", (event) => handleFile(event.target.files[0]));
 els.googleDocForm.addEventListener("submit", handleGoogleDocImport);
 els.processButton.addEventListener("click", processCurrentDocument);
-els.sampleButton.addEventListener("click", () => {
-  renderSample().catch((error) => {
-    console.error(error);
-    setStatus("Could not render sample.", 0);
-  });
-});
 els.zoomIn.addEventListener("click", () => setZoom(state.scale + 0.1));
 els.zoomOut.addEventListener("click", () => setZoom(state.scale - 0.1));
 els.fontSelect.addEventListener("change", (event) => {
@@ -4060,21 +4320,38 @@ els.lineDistanceRange.addEventListener("input", (event) => {
   });
 });
 els.settingsDoneButton.addEventListener("click", exitPopoverCustomization);
-els.headerColorSelect.addEventListener("change", (event) => {
+els.headerColorInput.addEventListener("input", (event) => {
   updateAnnotationColors({ headerColor: event.target.value }).catch((error) => {
     console.error(error);
     setStatus("Header color changed, but the preview could not be redrawn.", 0);
   });
 });
-els.bulletColorSelect.addEventListener("change", (event) => {
+els.bulletColorInput.addEventListener("input", (event) => {
   updateAnnotationColors({ bulletColor: event.target.value }).catch((error) => {
     console.error(error);
     setStatus("Bullet color changed, but the preview could not be redrawn.", 0);
   });
 });
+els.headerHexInput.addEventListener("change", (event) => {
+  updateAnnotationColors({ headerColor: event.target.value }).catch((error) => {
+    console.error(error);
+    setStatus("Header color changed, but the preview could not be redrawn.", 0);
+  });
+});
+els.bulletHexInput.addEventListener("change", (event) => {
+  updateAnnotationColors({ bulletColor: event.target.value }).catch((error) => {
+    console.error(error);
+    setStatus("Bullet color changed, but the preview could not be redrawn.", 0);
+  });
+});
+els.loginTab.addEventListener("click", () => setAuthMode("login"));
+els.signupTab.addEventListener("click", () => setAuthMode("signup"));
+els.authForm.addEventListener("submit", handleAuthSubmit);
+els.verifyForm.addEventListener("submit", handleVerifyEmail);
+els.logoutButton.addEventListener("click", logout);
+els.membershipButton.addEventListener("click", startMembershipCheckout);
 els.modelSelect.addEventListener("change", () => {
   state.selectedModel = els.modelSelect.value || DEFAULT_MODEL;
-  if (els.modelMeta) els.modelMeta.textContent = "";
 });
 window.addEventListener("scroll", refreshVisiblePopoverConnectors, true);
 window.addEventListener("resize", refreshVisiblePopoverConnectors);
